@@ -1,4 +1,13 @@
 <script>
+	import { db } from "./firebase";
+	import {
+		collection,
+		getDocs,
+		doc,
+		addDoc,
+		updateDoc,
+		deleteDoc,
+	} from "firebase/firestore";
 
 	let alumn = {
 		name: '',
@@ -33,7 +42,6 @@
 			<button>Agregar</button>
 		</form>
 	</div>
->>>>>>> developAlumns
 </main>
 
 <style>
