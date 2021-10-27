@@ -16,13 +16,33 @@
 		idWork: '',
 	}
 
-	const onAlumnSubmitHandler = (e) => {
-		console.log(alumn);
+	let alumns = [];
+
+	const loadAlumns = async () => {
+		const querySnapshot = await getDocs(collection(db, 'alumns'));
+		let dbAlumn = [];
+		querySnapshot.forEach((doc) => {
+			doc.push({ ...doc.data(), id: doc.idAlumn });
+		});
+		alumns = [...dbAlumn];
+		console.log(alumns);
+	}
+	loadAlumns();
+
+	const onAlumnSubmitHandler = async (e) => {
+		await addDoc(collection(db, 'alumns'), alumn);
+		await loadAlumns();
 	}
 </script>
 
 <main>
 	<div class="addAlumnsContainer">
+		{#each alumns as i}
+			<div>
+				<p>{i.name}</p>
+			</div>
+		{/each}
+	</div>
 		<h2>Agregar nuevo usuario:</h2>
 		<form on:submit|preventDefault={onAlumnSubmitHandler}>
 			<label for="alumnName">Nombre del alumno:</label>
@@ -41,7 +61,6 @@
 			/>
 			<button>Agregar</button>
 		</form>
-	</div>
 </main>
 
 <style>
