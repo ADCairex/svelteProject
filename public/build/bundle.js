@@ -13438,8 +13438,8 @@ var app = (function () {
     			p = element("p");
     			t0 = text(t0_value);
     			t1 = space();
-    			add_location(p, file, 41, 4, 727);
-    			add_location(div, file, 40, 3, 717);
+    			add_location(p, file, 41, 4, 729);
+    			add_location(div, file, 40, 3, 719);
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, div, anchor);
@@ -13519,23 +13519,23 @@ var app = (function () {
     			button = element("button");
     			button.textContent = "Agregar";
     			attr_dev(div, "class", "addAlumnsContainer");
-    			add_location(div, file, 38, 1, 659);
-    			add_location(h2, file, 45, 2, 773);
+    			add_location(div, file, 38, 1, 661);
+    			add_location(h2, file, 45, 2, 775);
     			attr_dev(label0, "for", "alumnName");
-    			add_location(label0, file, 47, 3, 865);
+    			add_location(label0, file, 47, 3, 867);
     			attr_dev(input0, "type", "text");
     			attr_dev(input0, "id", "alumnName");
     			attr_dev(input0, "placeholder", "Nombre");
-    			add_location(input0, file, 48, 3, 918);
+    			add_location(input0, file, 48, 3, 920);
     			attr_dev(label1, "for", "alumnCourse");
-    			add_location(label1, file, 54, 3, 1023);
+    			add_location(label1, file, 54, 3, 1025);
     			attr_dev(input1, "type", "text");
     			attr_dev(input1, "id", "alumnCourse");
     			attr_dev(input1, "placeholder", "Curso");
-    			add_location(input1, file, 55, 3, 1092);
-    			add_location(button, file, 61, 3, 1199);
-    			add_location(form, file, 46, 2, 807);
-    			add_location(main, file, 37, 0, 651);
+    			add_location(input1, file, 55, 3, 1094);
+    			add_location(button, file, 61, 3, 1201);
+    			add_location(form, file, 46, 2, 809);
+    			add_location(main, file, 37, 0, 653);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
@@ -13653,8 +13653,7 @@ var app = (function () {
     		console.log(alumns);
     	};
 
-    	loadAlumns();
-
+    	//loadAlumns();
     	const onAlumnSubmitHandler = async e => {
     		await gh(bc(db$1, 'alumns'), alumn);
     		await loadAlumns();

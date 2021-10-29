@@ -27,7 +27,7 @@
 		alumns = [...dbAlumn];
 		console.log(alumns);
 	}
-	loadAlumns();
+	//loadAlumns();
 
 	const onAlumnSubmitHandler = async (e) => {
 		await addDoc(collection(db, 'alumns'), alumn);
