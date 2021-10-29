@@ -4,6 +4,12 @@ var app = (function () {
     'use strict';
 
     function noop() { }
+    function assign(tar, src) {
+        // @ts-ignore
+        for (const k in src)
+            tar[k] = src[k];
+        return tar;
+    }
     function add_location(element, file, line, column, char) {
         element.__svelte_meta = {
             loc: { file, line, column, char }
@@ -26,6 +32,82 @@ var app = (function () {
     }
     function is_empty(obj) {
         return Object.keys(obj).length === 0;
+    }
+    function validate_store(store, name) {
+        if (store != null && typeof store.subscribe !== 'function') {
+            throw new Error(`'${name}' is not a store with a 'subscribe' method`);
+        }
+    }
+    function subscribe(store, ...callbacks) {
+        if (store == null) {
+            return noop;
+        }
+        const unsub = store.subscribe(...callbacks);
+        return unsub.unsubscribe ? () => unsub.unsubscribe() : unsub;
+    }
+    function component_subscribe(component, store, callback) {
+        component.$$.on_destroy.push(subscribe(store, callback));
+    }
+    function create_slot(definition, ctx, $$scope, fn) {
+        if (definition) {
+            const slot_ctx = get_slot_context(definition, ctx, $$scope, fn);
+            return definition[0](slot_ctx);
+        }
+    }
+    function get_slot_context(definition, ctx, $$scope, fn) {
+        return definition[1] && fn
+            ? assign($$scope.ctx.slice(), definition[1](fn(ctx)))
+            : $$scope.ctx;
+    }
+    function get_slot_changes(definition, $$scope, dirty, fn) {
+        if (definition[2] && fn) {
+            const lets = definition[2](fn(dirty));
+            if ($$scope.dirty === undefined) {
+                return lets;
+            }
+            if (typeof lets === 'object') {
+                const merged = [];
+                const len = Math.max($$scope.dirty.length, lets.length);
+                for (let i = 0; i < len; i += 1) {
+                    merged[i] = $$scope.dirty[i] | lets[i];
+                }
+                return merged;
+            }
+            return $$scope.dirty | lets;
+        }
+        return $$scope.dirty;
+    }
+    function update_slot_base(slot, slot_definition, ctx, $$scope, slot_changes, get_slot_context_fn) {
+        if (slot_changes) {
+            const slot_context = get_slot_context(slot_definition, ctx, $$scope, get_slot_context_fn);
+            slot.p(slot_context, slot_changes);
+        }
+    }
+    function get_all_dirty_from_scope($$scope) {
+        if ($$scope.ctx.length > 32) {
+            const dirty = [];
+            const length = $$scope.ctx.length / 32;
+            for (let i = 0; i < length; i++) {
+                dirty[i] = -1;
+            }
+            return dirty;
+        }
+        return -1;
+    }
+    function exclude_internal_props(props) {
+        const result = {};
+        for (const k in props)
+            if (k[0] !== '$')
+                result[k] = props[k];
+        return result;
+    }
+    function compute_rest_props(props, keys) {
+        const rest = {};
+        keys = new Set(keys);
+        for (const k in props)
+            if (!keys.has(k) && k[0] !== '$')
+                rest[k] = props[k];
+        return rest;
     }
     function append(target, node) {
         target.appendChild(node);
@@ -51,6 +133,9 @@ var app = (function () {
     function space() {
         return text(' ');
     }
+    function empty() {
+        return text('');
+    }
     function listen(node, event, handler, options) {
         node.addEventListener(event, handler, options);
         return () => node.removeEventListener(event, handler, options);
@@ -68,6 +153,27 @@ var app = (function () {
         else if (node.getAttribute(attribute) !== value)
             node.setAttribute(attribute, value);
     }
+    function set_attributes(node, attributes) {
+        // @ts-ignore
+        const descriptors = Object.getOwnPropertyDescriptors(node.__proto__);
+        for (const key in attributes) {
+            if (attributes[key] == null) {
+                node.removeAttribute(key);
+            }
+            else if (key === 'style') {
+                node.style.cssText = attributes[key];
+            }
+            else if (key === '__value') {
+                node.value = node[key] = attributes[key];
+            }
+            else if (descriptors[key] && descriptors[key].set) {
+                node[key] = attributes[key];
+            }
+            else {
+                attr(node, key, attributes[key]);
+            }
+        }
+    }
     function children(element) {
         return Array.from(element.childNodes);
     }
@@ -83,6 +189,37 @@ var app = (function () {
     let current_component;
     function set_current_component(component) {
         current_component = component;
+    }
+    function get_current_component() {
+        if (!current_component)
+            throw new Error('Function called outside component initialization');
+        return current_component;
+    }
+    function onMount(fn) {
+        get_current_component().$$.on_mount.push(fn);
+    }
+    function onDestroy(fn) {
+        get_current_component().$$.on_destroy.push(fn);
+    }
+    function createEventDispatcher() {
+        const component = get_current_component();
+        return (type, detail) => {
+            const callbacks = component.$$.callbacks[type];
+            if (callbacks) {
+                // TODO are there situations where events could be dispatched
+                // in a server (non-DOM) environment?
+                const event = custom_event(type, detail);
+                callbacks.slice().forEach(fn => {
+                    fn.call(component, event);
+                });
+            }
+        };
+    }
+    function setContext(key, context) {
+        get_current_component().$$.context.set(key, context);
+    }
+    function getContext(key) {
+        return get_current_component().$$.context.get(key);
     }
 
     const dirty_components = [];
@@ -149,10 +286,40 @@ var app = (function () {
         }
     }
     const outroing = new Set();
+    let outros;
+    function group_outros() {
+        outros = {
+            r: 0,
+            c: [],
+            p: outros // parent group
+        };
+    }
+    function check_outros() {
+        if (!outros.r) {
+            run_all(outros.c);
+        }
+        outros = outros.p;
+    }
     function transition_in(block, local) {
         if (block && block.i) {
             outroing.delete(block);
             block.i(local);
+        }
+    }
+    function transition_out(block, local, detach, callback) {
+        if (block && block.o) {
+            if (outroing.has(block))
+                return;
+            outroing.add(block);
+            outros.c.push(() => {
+                outroing.delete(block);
+                if (callback) {
+                    if (detach)
+                        block.d(1);
+                    callback();
+                }
+            });
+            block.o(local);
         }
     }
 
@@ -161,6 +328,46 @@ var app = (function () {
         : typeof globalThis !== 'undefined'
             ? globalThis
             : global);
+
+    function get_spread_update(levels, updates) {
+        const update = {};
+        const to_null_out = {};
+        const accounted_for = { $$scope: 1 };
+        let i = levels.length;
+        while (i--) {
+            const o = levels[i];
+            const n = updates[i];
+            if (n) {
+                for (const key in o) {
+                    if (!(key in n))
+                        to_null_out[key] = 1;
+                }
+                for (const key in n) {
+                    if (!accounted_for[key]) {
+                        update[key] = n[key];
+                        accounted_for[key] = 1;
+                    }
+                }
+                levels[i] = n;
+            }
+            else {
+                for (const key in o) {
+                    accounted_for[key] = 1;
+                }
+            }
+        }
+        for (const key in to_null_out) {
+            if (!(key in update))
+                update[key] = undefined;
+        }
+        return update;
+    }
+    function get_spread_object(spread_props) {
+        return typeof spread_props === 'object' && spread_props !== null ? spread_props : {};
+    }
+    function create_component(block) {
+        block && block.c();
+    }
     function mount_component(component, target, anchor, customElement) {
         const { fragment, on_mount, on_destroy, after_update } = component.$$;
         fragment && fragment.m(target, anchor);
@@ -363,6 +570,1583 @@ var app = (function () {
         }
         $capture_state() { }
         $inject_state() { }
+    }
+
+    const subscriber_queue = [];
+    /**
+     * Creates a `Readable` store that allows reading by subscription.
+     * @param value initial value
+     * @param {StartStopNotifier}start start and stop notifications for subscriptions
+     */
+    function readable(value, start) {
+        return {
+            subscribe: writable(value, start).subscribe
+        };
+    }
+    /**
+     * Create a `Writable` store that allows both updating and reading by subscription.
+     * @param {*=}value initial value
+     * @param {StartStopNotifier=}start start and stop notifications for subscriptions
+     */
+    function writable(value, start = noop) {
+        let stop;
+        const subscribers = new Set();
+        function set(new_value) {
+            if (safe_not_equal(value, new_value)) {
+                value = new_value;
+                if (stop) { // store is ready
+                    const run_queue = !subscriber_queue.length;
+                    for (const subscriber of subscribers) {
+                        subscriber[1]();
+                        subscriber_queue.push(subscriber, value);
+                    }
+                    if (run_queue) {
+                        for (let i = 0; i < subscriber_queue.length; i += 2) {
+                            subscriber_queue[i][0](subscriber_queue[i + 1]);
+                        }
+                        subscriber_queue.length = 0;
+                    }
+                }
+            }
+        }
+        function update(fn) {
+            set(fn(value));
+        }
+        function subscribe(run, invalidate = noop) {
+            const subscriber = [run, invalidate];
+            subscribers.add(subscriber);
+            if (subscribers.size === 1) {
+                stop = start(set) || noop;
+            }
+            run(value);
+            return () => {
+                subscribers.delete(subscriber);
+                if (subscribers.size === 0) {
+                    stop();
+                    stop = null;
+                }
+            };
+        }
+        return { set, update, subscribe };
+    }
+    function derived(stores, fn, initial_value) {
+        const single = !Array.isArray(stores);
+        const stores_array = single
+            ? [stores]
+            : stores;
+        const auto = fn.length < 2;
+        return readable(initial_value, (set) => {
+            let inited = false;
+            const values = [];
+            let pending = 0;
+            let cleanup = noop;
+            const sync = () => {
+                if (pending) {
+                    return;
+                }
+                cleanup();
+                const result = fn(single ? values[0] : values, set);
+                if (auto) {
+                    set(result);
+                }
+                else {
+                    cleanup = is_function(result) ? result : noop;
+                }
+            };
+            const unsubscribers = stores_array.map((store, i) => subscribe(store, (value) => {
+                values[i] = value;
+                pending &= ~(1 << i);
+                if (inited) {
+                    sync();
+                }
+            }, () => {
+                pending |= (1 << i);
+            }));
+            inited = true;
+            sync();
+            return function stop() {
+                run_all(unsubscribers);
+                cleanup();
+            };
+        });
+    }
+
+    const LOCATION = {};
+    const ROUTER = {};
+
+    /**
+     * Adapted from https://github.com/reach/router/blob/b60e6dd781d5d3a4bdaaf4de665649c0f6a7e78d/src/lib/history.js
+     *
+     * https://github.com/reach/router/blob/master/LICENSE
+     * */
+
+    function getLocation(source) {
+      return {
+        ...source.location,
+        state: source.history.state,
+        key: (source.history.state && source.history.state.key) || "initial"
+      };
+    }
+
+    function createHistory(source, options) {
+      const listeners = [];
+      let location = getLocation(source);
+
+      return {
+        get location() {
+          return location;
+        },
+
+        listen(listener) {
+          listeners.push(listener);
+
+          const popstateListener = () => {
+            location = getLocation(source);
+            listener({ location, action: "POP" });
+          };
+
+          source.addEventListener("popstate", popstateListener);
+
+          return () => {
+            source.removeEventListener("popstate", popstateListener);
+
+            const index = listeners.indexOf(listener);
+            listeners.splice(index, 1);
+          };
+        },
+
+        navigate(to, { state, replace = false } = {}) {
+          state = { ...state, key: Date.now() + "" };
+          // try...catch iOS Safari limits to 100 pushState calls
+          try {
+            if (replace) {
+              source.history.replaceState(state, null, to);
+            } else {
+              source.history.pushState(state, null, to);
+            }
+          } catch (e) {
+            source.location[replace ? "replace" : "assign"](to);
+          }
+
+          location = getLocation(source);
+          listeners.forEach(listener => listener({ location, action: "PUSH" }));
+        }
+      };
+    }
+
+    // Stores history entries in memory for testing or other platforms like Native
+    function createMemorySource(initialPathname = "/") {
+      let index = 0;
+      const stack = [{ pathname: initialPathname, search: "" }];
+      const states = [];
+
+      return {
+        get location() {
+          return stack[index];
+        },
+        addEventListener(name, fn) {},
+        removeEventListener(name, fn) {},
+        history: {
+          get entries() {
+            return stack;
+          },
+          get index() {
+            return index;
+          },
+          get state() {
+            return states[index];
+          },
+          pushState(state, _, uri) {
+            const [pathname, search = ""] = uri.split("?");
+            index++;
+            stack.push({ pathname, search });
+            states.push(state);
+          },
+          replaceState(state, _, uri) {
+            const [pathname, search = ""] = uri.split("?");
+            stack[index] = { pathname, search };
+            states[index] = state;
+          }
+        }
+      };
+    }
+
+    // Global history uses window.history as the source if available,
+    // otherwise a memory history
+    const canUseDOM = Boolean(
+      typeof window !== "undefined" &&
+        window.document &&
+        window.document.createElement
+    );
+    const globalHistory = createHistory(canUseDOM ? window : createMemorySource());
+    const { navigate } = globalHistory;
+
+    /**
+     * Adapted from https://github.com/reach/router/blob/b60e6dd781d5d3a4bdaaf4de665649c0f6a7e78d/src/lib/utils.js
+     *
+     * https://github.com/reach/router/blob/master/LICENSE
+     * */
+
+    const paramRe = /^:(.+)/;
+
+    const SEGMENT_POINTS = 4;
+    const STATIC_POINTS = 3;
+    const DYNAMIC_POINTS = 2;
+    const SPLAT_PENALTY = 1;
+    const ROOT_POINTS = 1;
+
+    /**
+     * Check if `string` starts with `search`
+     * @param {string} string
+     * @param {string} search
+     * @return {boolean}
+     */
+    function startsWith(string, search) {
+      return string.substr(0, search.length) === search;
+    }
+
+    /**
+     * Check if `segment` is a root segment
+     * @param {string} segment
+     * @return {boolean}
+     */
+    function isRootSegment(segment) {
+      return segment === "";
+    }
+
+    /**
+     * Check if `segment` is a dynamic segment
+     * @param {string} segment
+     * @return {boolean}
+     */
+    function isDynamic(segment) {
+      return paramRe.test(segment);
+    }
+
+    /**
+     * Check if `segment` is a splat
+     * @param {string} segment
+     * @return {boolean}
+     */
+    function isSplat(segment) {
+      return segment[0] === "*";
+    }
+
+    /**
+     * Split up the URI into segments delimited by `/`
+     * @param {string} uri
+     * @return {string[]}
+     */
+    function segmentize(uri) {
+      return (
+        uri
+          // Strip starting/ending `/`
+          .replace(/(^\/+|\/+$)/g, "")
+          .split("/")
+      );
+    }
+
+    /**
+     * Strip `str` of potential start and end `/`
+     * @param {string} str
+     * @return {string}
+     */
+    function stripSlashes(str) {
+      return str.replace(/(^\/+|\/+$)/g, "");
+    }
+
+    /**
+     * Score a route depending on how its individual segments look
+     * @param {object} route
+     * @param {number} index
+     * @return {object}
+     */
+    function rankRoute(route, index) {
+      const score = route.default
+        ? 0
+        : segmentize(route.path).reduce((score, segment) => {
+            score += SEGMENT_POINTS;
+
+            if (isRootSegment(segment)) {
+              score += ROOT_POINTS;
+            } else if (isDynamic(segment)) {
+              score += DYNAMIC_POINTS;
+            } else if (isSplat(segment)) {
+              score -= SEGMENT_POINTS + SPLAT_PENALTY;
+            } else {
+              score += STATIC_POINTS;
+            }
+
+            return score;
+          }, 0);
+
+      return { route, score, index };
+    }
+
+    /**
+     * Give a score to all routes and sort them on that
+     * @param {object[]} routes
+     * @return {object[]}
+     */
+    function rankRoutes(routes) {
+      return (
+        routes
+          .map(rankRoute)
+          // If two routes have the exact same score, we go by index instead
+          .sort((a, b) =>
+            a.score < b.score ? 1 : a.score > b.score ? -1 : a.index - b.index
+          )
+      );
+    }
+
+    /**
+     * Ranks and picks the best route to match. Each segment gets the highest
+     * amount of points, then the type of segment gets an additional amount of
+     * points where
+     *
+     *  static > dynamic > splat > root
+     *
+     * This way we don't have to worry about the order of our routes, let the
+     * computers do it.
+     *
+     * A route looks like this
+     *
+     *  { path, default, value }
+     *
+     * And a returned match looks like:
+     *
+     *  { route, params, uri }
+     *
+     * @param {object[]} routes
+     * @param {string} uri
+     * @return {?object}
+     */
+    function pick(routes, uri) {
+      let match;
+      let default_;
+
+      const [uriPathname] = uri.split("?");
+      const uriSegments = segmentize(uriPathname);
+      const isRootUri = uriSegments[0] === "";
+      const ranked = rankRoutes(routes);
+
+      for (let i = 0, l = ranked.length; i < l; i++) {
+        const route = ranked[i].route;
+        let missed = false;
+
+        if (route.default) {
+          default_ = {
+            route,
+            params: {},
+            uri
+          };
+          continue;
+        }
+
+        const routeSegments = segmentize(route.path);
+        const params = {};
+        const max = Math.max(uriSegments.length, routeSegments.length);
+        let index = 0;
+
+        for (; index < max; index++) {
+          const routeSegment = routeSegments[index];
+          const uriSegment = uriSegments[index];
+
+          if (routeSegment !== undefined && isSplat(routeSegment)) {
+            // Hit a splat, just grab the rest, and return a match
+            // uri:   /files/documents/work
+            // route: /files/* or /files/*splatname
+            const splatName = routeSegment === "*" ? "*" : routeSegment.slice(1);
+
+            params[splatName] = uriSegments
+              .slice(index)
+              .map(decodeURIComponent)
+              .join("/");
+            break;
+          }
+
+          if (uriSegment === undefined) {
+            // URI is shorter than the route, no match
+            // uri:   /users
+            // route: /users/:userId
+            missed = true;
+            break;
+          }
+
+          let dynamicMatch = paramRe.exec(routeSegment);
+
+          if (dynamicMatch && !isRootUri) {
+            const value = decodeURIComponent(uriSegment);
+            params[dynamicMatch[1]] = value;
+          } else if (routeSegment !== uriSegment) {
+            // Current segments don't match, not dynamic, not splat, so no match
+            // uri:   /users/123/settings
+            // route: /users/:id/profile
+            missed = true;
+            break;
+          }
+        }
+
+        if (!missed) {
+          match = {
+            route,
+            params,
+            uri: "/" + uriSegments.slice(0, index).join("/")
+          };
+          break;
+        }
+      }
+
+      return match || default_ || null;
+    }
+
+    /**
+     * Check if the `path` matches the `uri`.
+     * @param {string} path
+     * @param {string} uri
+     * @return {?object}
+     */
+    function match(route, uri) {
+      return pick([route], uri);
+    }
+
+    /**
+     * Add the query to the pathname if a query is given
+     * @param {string} pathname
+     * @param {string} [query]
+     * @return {string}
+     */
+    function addQuery(pathname, query) {
+      return pathname + (query ? `?${query}` : "");
+    }
+
+    /**
+     * Resolve URIs as though every path is a directory, no files. Relative URIs
+     * in the browser can feel awkward because not only can you be "in a directory",
+     * you can be "at a file", too. For example:
+     *
+     *  browserSpecResolve('foo', '/bar/') => /bar/foo
+     *  browserSpecResolve('foo', '/bar') => /foo
+     *
+     * But on the command line of a file system, it's not as complicated. You can't
+     * `cd` from a file, only directories. This way, links have to know less about
+     * their current path. To go deeper you can do this:
+     *
+     *  <Link to="deeper"/>
+     *  // instead of
+     *  <Link to=`{${props.uri}/deeper}`/>
+     *
+     * Just like `cd`, if you want to go deeper from the command line, you do this:
+     *
+     *  cd deeper
+     *  # not
+     *  cd $(pwd)/deeper
+     *
+     * By treating every path as a directory, linking to relative paths should
+     * require less contextual information and (fingers crossed) be more intuitive.
+     * @param {string} to
+     * @param {string} base
+     * @return {string}
+     */
+    function resolve(to, base) {
+      // /foo/bar, /baz/qux => /foo/bar
+      if (startsWith(to, "/")) {
+        return to;
+      }
+
+      const [toPathname, toQuery] = to.split("?");
+      const [basePathname] = base.split("?");
+      const toSegments = segmentize(toPathname);
+      const baseSegments = segmentize(basePathname);
+
+      // ?a=b, /users?b=c => /users?a=b
+      if (toSegments[0] === "") {
+        return addQuery(basePathname, toQuery);
+      }
+
+      // profile, /users/789 => /users/789/profile
+      if (!startsWith(toSegments[0], ".")) {
+        const pathname = baseSegments.concat(toSegments).join("/");
+
+        return addQuery((basePathname === "/" ? "" : "/") + pathname, toQuery);
+      }
+
+      // ./       , /users/123 => /users/123
+      // ../      , /users/123 => /users
+      // ../..    , /users/123 => /
+      // ../../one, /a/b/c/d   => /a/b/one
+      // .././one , /a/b/c/d   => /a/b/c/one
+      const allSegments = baseSegments.concat(toSegments);
+      const segments = [];
+
+      allSegments.forEach(segment => {
+        if (segment === "..") {
+          segments.pop();
+        } else if (segment !== ".") {
+          segments.push(segment);
+        }
+      });
+
+      return addQuery("/" + segments.join("/"), toQuery);
+    }
+
+    /**
+     * Combines the `basepath` and the `path` into one path.
+     * @param {string} basepath
+     * @param {string} path
+     */
+    function combinePaths(basepath, path) {
+      return `${stripSlashes(
+    path === "/" ? basepath : `${stripSlashes(basepath)}/${stripSlashes(path)}`
+  )}/`;
+    }
+
+    /**
+     * Decides whether a given `event` should result in a navigation or not.
+     * @param {object} event
+     */
+    function shouldNavigate(event) {
+      return (
+        !event.defaultPrevented &&
+        event.button === 0 &&
+        !(event.metaKey || event.altKey || event.ctrlKey || event.shiftKey)
+      );
+    }
+
+    /* node_modules/svelte-routing/src/Router.svelte generated by Svelte v3.44.0 */
+
+    function create_fragment$5(ctx) {
+    	let current;
+    	const default_slot_template = /*#slots*/ ctx[9].default;
+    	const default_slot = create_slot(default_slot_template, ctx, /*$$scope*/ ctx[8], null);
+
+    	const block = {
+    		c: function create() {
+    			if (default_slot) default_slot.c();
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			if (default_slot) {
+    				default_slot.m(target, anchor);
+    			}
+
+    			current = true;
+    		},
+    		p: function update(ctx, [dirty]) {
+    			if (default_slot) {
+    				if (default_slot.p && (!current || dirty & /*$$scope*/ 256)) {
+    					update_slot_base(
+    						default_slot,
+    						default_slot_template,
+    						ctx,
+    						/*$$scope*/ ctx[8],
+    						!current
+    						? get_all_dirty_from_scope(/*$$scope*/ ctx[8])
+    						: get_slot_changes(default_slot_template, /*$$scope*/ ctx[8], dirty, null),
+    						null
+    					);
+    				}
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(default_slot, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(default_slot, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (default_slot) default_slot.d(detaching);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$5.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$5($$self, $$props, $$invalidate) {
+    	let $location;
+    	let $routes;
+    	let $base;
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots('Router', slots, ['default']);
+    	let { basepath = "/" } = $$props;
+    	let { url = null } = $$props;
+    	const locationContext = getContext(LOCATION);
+    	const routerContext = getContext(ROUTER);
+    	const routes = writable([]);
+    	validate_store(routes, 'routes');
+    	component_subscribe($$self, routes, value => $$invalidate(6, $routes = value));
+    	const activeRoute = writable(null);
+    	let hasActiveRoute = false; // Used in SSR to synchronously set that a Route is active.
+
+    	// If locationContext is not set, this is the topmost Router in the tree.
+    	// If the `url` prop is given we force the location to it.
+    	const location = locationContext || writable(url ? { pathname: url } : globalHistory.location);
+
+    	validate_store(location, 'location');
+    	component_subscribe($$self, location, value => $$invalidate(5, $location = value));
+
+    	// If routerContext is set, the routerBase of the parent Router
+    	// will be the base for this Router's descendants.
+    	// If routerContext is not set, the path and resolved uri will both
+    	// have the value of the basepath prop.
+    	const base = routerContext
+    	? routerContext.routerBase
+    	: writable({ path: basepath, uri: basepath });
+
+    	validate_store(base, 'base');
+    	component_subscribe($$self, base, value => $$invalidate(7, $base = value));
+
+    	const routerBase = derived([base, activeRoute], ([base, activeRoute]) => {
+    		// If there is no activeRoute, the routerBase will be identical to the base.
+    		if (activeRoute === null) {
+    			return base;
+    		}
+
+    		const { path: basepath } = base;
+    		const { route, uri } = activeRoute;
+
+    		// Remove the potential /* or /*splatname from
+    		// the end of the child Routes relative paths.
+    		const path = route.default
+    		? basepath
+    		: route.path.replace(/\*.*$/, "");
+
+    		return { path, uri };
+    	});
+
+    	function registerRoute(route) {
+    		const { path: basepath } = $base;
+    		let { path } = route;
+
+    		// We store the original path in the _path property so we can reuse
+    		// it when the basepath changes. The only thing that matters is that
+    		// the route reference is intact, so mutation is fine.
+    		route._path = path;
+
+    		route.path = combinePaths(basepath, path);
+
+    		if (typeof window === "undefined") {
+    			// In SSR we should set the activeRoute immediately if it is a match.
+    			// If there are more Routes being registered after a match is found,
+    			// we just skip them.
+    			if (hasActiveRoute) {
+    				return;
+    			}
+
+    			const matchingRoute = match(route, $location.pathname);
+
+    			if (matchingRoute) {
+    				activeRoute.set(matchingRoute);
+    				hasActiveRoute = true;
+    			}
+    		} else {
+    			routes.update(rs => {
+    				rs.push(route);
+    				return rs;
+    			});
+    		}
+    	}
+
+    	function unregisterRoute(route) {
+    		routes.update(rs => {
+    			const index = rs.indexOf(route);
+    			rs.splice(index, 1);
+    			return rs;
+    		});
+    	}
+
+    	if (!locationContext) {
+    		// The topmost Router in the tree is responsible for updating
+    		// the location store and supplying it through context.
+    		onMount(() => {
+    			const unlisten = globalHistory.listen(history => {
+    				location.set(history.location);
+    			});
+
+    			return unlisten;
+    		});
+
+    		setContext(LOCATION, location);
+    	}
+
+    	setContext(ROUTER, {
+    		activeRoute,
+    		base,
+    		routerBase,
+    		registerRoute,
+    		unregisterRoute
+    	});
+
+    	const writable_props = ['basepath', 'url'];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<Router> was created with unknown prop '${key}'`);
+    	});
+
+    	$$self.$$set = $$props => {
+    		if ('basepath' in $$props) $$invalidate(3, basepath = $$props.basepath);
+    		if ('url' in $$props) $$invalidate(4, url = $$props.url);
+    		if ('$$scope' in $$props) $$invalidate(8, $$scope = $$props.$$scope);
+    	};
+
+    	$$self.$capture_state = () => ({
+    		getContext,
+    		setContext,
+    		onMount,
+    		writable,
+    		derived,
+    		LOCATION,
+    		ROUTER,
+    		globalHistory,
+    		pick,
+    		match,
+    		stripSlashes,
+    		combinePaths,
+    		basepath,
+    		url,
+    		locationContext,
+    		routerContext,
+    		routes,
+    		activeRoute,
+    		hasActiveRoute,
+    		location,
+    		base,
+    		routerBase,
+    		registerRoute,
+    		unregisterRoute,
+    		$location,
+    		$routes,
+    		$base
+    	});
+
+    	$$self.$inject_state = $$props => {
+    		if ('basepath' in $$props) $$invalidate(3, basepath = $$props.basepath);
+    		if ('url' in $$props) $$invalidate(4, url = $$props.url);
+    		if ('hasActiveRoute' in $$props) hasActiveRoute = $$props.hasActiveRoute;
+    	};
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	$$self.$$.update = () => {
+    		if ($$self.$$.dirty & /*$base*/ 128) {
+    			// This reactive statement will update all the Routes' path when
+    			// the basepath changes.
+    			{
+    				const { path: basepath } = $base;
+
+    				routes.update(rs => {
+    					rs.forEach(r => r.path = combinePaths(basepath, r._path));
+    					return rs;
+    				});
+    			}
+    		}
+
+    		if ($$self.$$.dirty & /*$routes, $location*/ 96) {
+    			// This reactive statement will be run when the Router is created
+    			// when there are no Routes and then again the following tick, so it
+    			// will not find an active Route in SSR and in the browser it will only
+    			// pick an active Route after all Routes have been registered.
+    			{
+    				const bestMatch = pick($routes, $location.pathname);
+    				activeRoute.set(bestMatch);
+    			}
+    		}
+    	};
+
+    	return [
+    		routes,
+    		location,
+    		base,
+    		basepath,
+    		url,
+    		$location,
+    		$routes,
+    		$base,
+    		$$scope,
+    		slots
+    	];
+    }
+
+    class Router extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$5, create_fragment$5, safe_not_equal, { basepath: 3, url: 4 });
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Router",
+    			options,
+    			id: create_fragment$5.name
+    		});
+    	}
+
+    	get basepath() {
+    		throw new Error("<Router>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set basepath(value) {
+    		throw new Error("<Router>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get url() {
+    		throw new Error("<Router>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set url(value) {
+    		throw new Error("<Router>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+    }
+
+    /* node_modules/svelte-routing/src/Route.svelte generated by Svelte v3.44.0 */
+
+    const get_default_slot_changes = dirty => ({
+    	params: dirty & /*routeParams*/ 4,
+    	location: dirty & /*$location*/ 16
+    });
+
+    const get_default_slot_context = ctx => ({
+    	params: /*routeParams*/ ctx[2],
+    	location: /*$location*/ ctx[4]
+    });
+
+    // (40:0) {#if $activeRoute !== null && $activeRoute.route === route}
+    function create_if_block$2(ctx) {
+    	let current_block_type_index;
+    	let if_block;
+    	let if_block_anchor;
+    	let current;
+    	const if_block_creators = [create_if_block_1, create_else_block$2];
+    	const if_blocks = [];
+
+    	function select_block_type(ctx, dirty) {
+    		if (/*component*/ ctx[0] !== null) return 0;
+    		return 1;
+    	}
+
+    	current_block_type_index = select_block_type(ctx);
+    	if_block = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+
+    	const block = {
+    		c: function create() {
+    			if_block.c();
+    			if_block_anchor = empty();
+    		},
+    		m: function mount(target, anchor) {
+    			if_blocks[current_block_type_index].m(target, anchor);
+    			insert_dev(target, if_block_anchor, anchor);
+    			current = true;
+    		},
+    		p: function update(ctx, dirty) {
+    			let previous_block_index = current_block_type_index;
+    			current_block_type_index = select_block_type(ctx);
+
+    			if (current_block_type_index === previous_block_index) {
+    				if_blocks[current_block_type_index].p(ctx, dirty);
+    			} else {
+    				group_outros();
+
+    				transition_out(if_blocks[previous_block_index], 1, 1, () => {
+    					if_blocks[previous_block_index] = null;
+    				});
+
+    				check_outros();
+    				if_block = if_blocks[current_block_type_index];
+
+    				if (!if_block) {
+    					if_block = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+    					if_block.c();
+    				} else {
+    					if_block.p(ctx, dirty);
+    				}
+
+    				transition_in(if_block, 1);
+    				if_block.m(if_block_anchor.parentNode, if_block_anchor);
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(if_block);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(if_block);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if_blocks[current_block_type_index].d(detaching);
+    			if (detaching) detach_dev(if_block_anchor);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block$2.name,
+    		type: "if",
+    		source: "(40:0) {#if $activeRoute !== null && $activeRoute.route === route}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (43:2) {:else}
+    function create_else_block$2(ctx) {
+    	let current;
+    	const default_slot_template = /*#slots*/ ctx[10].default;
+    	const default_slot = create_slot(default_slot_template, ctx, /*$$scope*/ ctx[9], get_default_slot_context);
+
+    	const block = {
+    		c: function create() {
+    			if (default_slot) default_slot.c();
+    		},
+    		m: function mount(target, anchor) {
+    			if (default_slot) {
+    				default_slot.m(target, anchor);
+    			}
+
+    			current = true;
+    		},
+    		p: function update(ctx, dirty) {
+    			if (default_slot) {
+    				if (default_slot.p && (!current || dirty & /*$$scope, routeParams, $location*/ 532)) {
+    					update_slot_base(
+    						default_slot,
+    						default_slot_template,
+    						ctx,
+    						/*$$scope*/ ctx[9],
+    						!current
+    						? get_all_dirty_from_scope(/*$$scope*/ ctx[9])
+    						: get_slot_changes(default_slot_template, /*$$scope*/ ctx[9], dirty, get_default_slot_changes),
+    						get_default_slot_context
+    					);
+    				}
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(default_slot, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(default_slot, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (default_slot) default_slot.d(detaching);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_else_block$2.name,
+    		type: "else",
+    		source: "(43:2) {:else}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (41:2) {#if component !== null}
+    function create_if_block_1(ctx) {
+    	let switch_instance;
+    	let switch_instance_anchor;
+    	let current;
+
+    	const switch_instance_spread_levels = [
+    		{ location: /*$location*/ ctx[4] },
+    		/*routeParams*/ ctx[2],
+    		/*routeProps*/ ctx[3]
+    	];
+
+    	var switch_value = /*component*/ ctx[0];
+
+    	function switch_props(ctx) {
+    		let switch_instance_props = {};
+
+    		for (let i = 0; i < switch_instance_spread_levels.length; i += 1) {
+    			switch_instance_props = assign(switch_instance_props, switch_instance_spread_levels[i]);
+    		}
+
+    		return {
+    			props: switch_instance_props,
+    			$$inline: true
+    		};
+    	}
+
+    	if (switch_value) {
+    		switch_instance = new switch_value(switch_props());
+    	}
+
+    	const block = {
+    		c: function create() {
+    			if (switch_instance) create_component(switch_instance.$$.fragment);
+    			switch_instance_anchor = empty();
+    		},
+    		m: function mount(target, anchor) {
+    			if (switch_instance) {
+    				mount_component(switch_instance, target, anchor);
+    			}
+
+    			insert_dev(target, switch_instance_anchor, anchor);
+    			current = true;
+    		},
+    		p: function update(ctx, dirty) {
+    			const switch_instance_changes = (dirty & /*$location, routeParams, routeProps*/ 28)
+    			? get_spread_update(switch_instance_spread_levels, [
+    					dirty & /*$location*/ 16 && { location: /*$location*/ ctx[4] },
+    					dirty & /*routeParams*/ 4 && get_spread_object(/*routeParams*/ ctx[2]),
+    					dirty & /*routeProps*/ 8 && get_spread_object(/*routeProps*/ ctx[3])
+    				])
+    			: {};
+
+    			if (switch_value !== (switch_value = /*component*/ ctx[0])) {
+    				if (switch_instance) {
+    					group_outros();
+    					const old_component = switch_instance;
+
+    					transition_out(old_component.$$.fragment, 1, 0, () => {
+    						destroy_component(old_component, 1);
+    					});
+
+    					check_outros();
+    				}
+
+    				if (switch_value) {
+    					switch_instance = new switch_value(switch_props());
+    					create_component(switch_instance.$$.fragment);
+    					transition_in(switch_instance.$$.fragment, 1);
+    					mount_component(switch_instance, switch_instance_anchor.parentNode, switch_instance_anchor);
+    				} else {
+    					switch_instance = null;
+    				}
+    			} else if (switch_value) {
+    				switch_instance.$set(switch_instance_changes);
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			if (switch_instance) transition_in(switch_instance.$$.fragment, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			if (switch_instance) transition_out(switch_instance.$$.fragment, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(switch_instance_anchor);
+    			if (switch_instance) destroy_component(switch_instance, detaching);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block_1.name,
+    		type: "if",
+    		source: "(41:2) {#if component !== null}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function create_fragment$4(ctx) {
+    	let if_block_anchor;
+    	let current;
+    	let if_block = /*$activeRoute*/ ctx[1] !== null && /*$activeRoute*/ ctx[1].route === /*route*/ ctx[7] && create_if_block$2(ctx);
+
+    	const block = {
+    		c: function create() {
+    			if (if_block) if_block.c();
+    			if_block_anchor = empty();
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			if (if_block) if_block.m(target, anchor);
+    			insert_dev(target, if_block_anchor, anchor);
+    			current = true;
+    		},
+    		p: function update(ctx, [dirty]) {
+    			if (/*$activeRoute*/ ctx[1] !== null && /*$activeRoute*/ ctx[1].route === /*route*/ ctx[7]) {
+    				if (if_block) {
+    					if_block.p(ctx, dirty);
+
+    					if (dirty & /*$activeRoute*/ 2) {
+    						transition_in(if_block, 1);
+    					}
+    				} else {
+    					if_block = create_if_block$2(ctx);
+    					if_block.c();
+    					transition_in(if_block, 1);
+    					if_block.m(if_block_anchor.parentNode, if_block_anchor);
+    				}
+    			} else if (if_block) {
+    				group_outros();
+
+    				transition_out(if_block, 1, 1, () => {
+    					if_block = null;
+    				});
+
+    				check_outros();
+    			}
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(if_block);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(if_block);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (if_block) if_block.d(detaching);
+    			if (detaching) detach_dev(if_block_anchor);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$4.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$4($$self, $$props, $$invalidate) {
+    	let $activeRoute;
+    	let $location;
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots('Route', slots, ['default']);
+    	let { path = "" } = $$props;
+    	let { component = null } = $$props;
+    	const { registerRoute, unregisterRoute, activeRoute } = getContext(ROUTER);
+    	validate_store(activeRoute, 'activeRoute');
+    	component_subscribe($$self, activeRoute, value => $$invalidate(1, $activeRoute = value));
+    	const location = getContext(LOCATION);
+    	validate_store(location, 'location');
+    	component_subscribe($$self, location, value => $$invalidate(4, $location = value));
+
+    	const route = {
+    		path,
+    		// If no path prop is given, this Route will act as the default Route
+    		// that is rendered if no other Route in the Router is a match.
+    		default: path === ""
+    	};
+
+    	let routeParams = {};
+    	let routeProps = {};
+    	registerRoute(route);
+
+    	// There is no need to unregister Routes in SSR since it will all be
+    	// thrown away anyway.
+    	if (typeof window !== "undefined") {
+    		onDestroy(() => {
+    			unregisterRoute(route);
+    		});
+    	}
+
+    	$$self.$$set = $$new_props => {
+    		$$invalidate(13, $$props = assign(assign({}, $$props), exclude_internal_props($$new_props)));
+    		if ('path' in $$new_props) $$invalidate(8, path = $$new_props.path);
+    		if ('component' in $$new_props) $$invalidate(0, component = $$new_props.component);
+    		if ('$$scope' in $$new_props) $$invalidate(9, $$scope = $$new_props.$$scope);
+    	};
+
+    	$$self.$capture_state = () => ({
+    		getContext,
+    		onDestroy,
+    		ROUTER,
+    		LOCATION,
+    		path,
+    		component,
+    		registerRoute,
+    		unregisterRoute,
+    		activeRoute,
+    		location,
+    		route,
+    		routeParams,
+    		routeProps,
+    		$activeRoute,
+    		$location
+    	});
+
+    	$$self.$inject_state = $$new_props => {
+    		$$invalidate(13, $$props = assign(assign({}, $$props), $$new_props));
+    		if ('path' in $$props) $$invalidate(8, path = $$new_props.path);
+    		if ('component' in $$props) $$invalidate(0, component = $$new_props.component);
+    		if ('routeParams' in $$props) $$invalidate(2, routeParams = $$new_props.routeParams);
+    		if ('routeProps' in $$props) $$invalidate(3, routeProps = $$new_props.routeProps);
+    	};
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	$$self.$$.update = () => {
+    		if ($$self.$$.dirty & /*$activeRoute*/ 2) {
+    			if ($activeRoute && $activeRoute.route === route) {
+    				$$invalidate(2, routeParams = $activeRoute.params);
+    			}
+    		}
+
+    		{
+    			const { path, component, ...rest } = $$props;
+    			$$invalidate(3, routeProps = rest);
+    		}
+    	};
+
+    	$$props = exclude_internal_props($$props);
+
+    	return [
+    		component,
+    		$activeRoute,
+    		routeParams,
+    		routeProps,
+    		$location,
+    		activeRoute,
+    		location,
+    		route,
+    		path,
+    		$$scope,
+    		slots
+    	];
+    }
+
+    class Route extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$4, create_fragment$4, safe_not_equal, { path: 8, component: 0 });
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Route",
+    			options,
+    			id: create_fragment$4.name
+    		});
+    	}
+
+    	get path() {
+    		throw new Error("<Route>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set path(value) {
+    		throw new Error("<Route>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get component() {
+    		throw new Error("<Route>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set component(value) {
+    		throw new Error("<Route>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+    }
+
+    /* node_modules/svelte-routing/src/Link.svelte generated by Svelte v3.44.0 */
+    const file$3 = "node_modules/svelte-routing/src/Link.svelte";
+
+    function create_fragment$3(ctx) {
+    	let a;
+    	let current;
+    	let mounted;
+    	let dispose;
+    	const default_slot_template = /*#slots*/ ctx[16].default;
+    	const default_slot = create_slot(default_slot_template, ctx, /*$$scope*/ ctx[15], null);
+
+    	let a_levels = [
+    		{ href: /*href*/ ctx[0] },
+    		{ "aria-current": /*ariaCurrent*/ ctx[2] },
+    		/*props*/ ctx[1],
+    		/*$$restProps*/ ctx[6]
+    	];
+
+    	let a_data = {};
+
+    	for (let i = 0; i < a_levels.length; i += 1) {
+    		a_data = assign(a_data, a_levels[i]);
+    	}
+
+    	const block = {
+    		c: function create() {
+    			a = element("a");
+    			if (default_slot) default_slot.c();
+    			set_attributes(a, a_data);
+    			add_location(a, file$3, 40, 0, 1249);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, a, anchor);
+
+    			if (default_slot) {
+    				default_slot.m(a, null);
+    			}
+
+    			current = true;
+
+    			if (!mounted) {
+    				dispose = listen_dev(a, "click", /*onClick*/ ctx[5], false, false, false);
+    				mounted = true;
+    			}
+    		},
+    		p: function update(ctx, [dirty]) {
+    			if (default_slot) {
+    				if (default_slot.p && (!current || dirty & /*$$scope*/ 32768)) {
+    					update_slot_base(
+    						default_slot,
+    						default_slot_template,
+    						ctx,
+    						/*$$scope*/ ctx[15],
+    						!current
+    						? get_all_dirty_from_scope(/*$$scope*/ ctx[15])
+    						: get_slot_changes(default_slot_template, /*$$scope*/ ctx[15], dirty, null),
+    						null
+    					);
+    				}
+    			}
+
+    			set_attributes(a, a_data = get_spread_update(a_levels, [
+    				(!current || dirty & /*href*/ 1) && { href: /*href*/ ctx[0] },
+    				(!current || dirty & /*ariaCurrent*/ 4) && { "aria-current": /*ariaCurrent*/ ctx[2] },
+    				dirty & /*props*/ 2 && /*props*/ ctx[1],
+    				dirty & /*$$restProps*/ 64 && /*$$restProps*/ ctx[6]
+    			]));
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(default_slot, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(default_slot, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(a);
+    			if (default_slot) default_slot.d(detaching);
+    			mounted = false;
+    			dispose();
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$3.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$3($$self, $$props, $$invalidate) {
+    	let ariaCurrent;
+    	const omit_props_names = ["to","replace","state","getProps"];
+    	let $$restProps = compute_rest_props($$props, omit_props_names);
+    	let $location;
+    	let $base;
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots('Link', slots, ['default']);
+    	let { to = "#" } = $$props;
+    	let { replace = false } = $$props;
+    	let { state = {} } = $$props;
+    	let { getProps = () => ({}) } = $$props;
+    	const { base } = getContext(ROUTER);
+    	validate_store(base, 'base');
+    	component_subscribe($$self, base, value => $$invalidate(14, $base = value));
+    	const location = getContext(LOCATION);
+    	validate_store(location, 'location');
+    	component_subscribe($$self, location, value => $$invalidate(13, $location = value));
+    	const dispatch = createEventDispatcher();
+    	let href, isPartiallyCurrent, isCurrent, props;
+
+    	function onClick(event) {
+    		dispatch("click", event);
+
+    		if (shouldNavigate(event)) {
+    			event.preventDefault();
+
+    			// Don't push another entry to the history stack when the user
+    			// clicks on a Link to the page they are currently on.
+    			const shouldReplace = $location.pathname === href || replace;
+
+    			navigate(href, { state, replace: shouldReplace });
+    		}
+    	}
+
+    	$$self.$$set = $$new_props => {
+    		$$props = assign(assign({}, $$props), exclude_internal_props($$new_props));
+    		$$invalidate(6, $$restProps = compute_rest_props($$props, omit_props_names));
+    		if ('to' in $$new_props) $$invalidate(7, to = $$new_props.to);
+    		if ('replace' in $$new_props) $$invalidate(8, replace = $$new_props.replace);
+    		if ('state' in $$new_props) $$invalidate(9, state = $$new_props.state);
+    		if ('getProps' in $$new_props) $$invalidate(10, getProps = $$new_props.getProps);
+    		if ('$$scope' in $$new_props) $$invalidate(15, $$scope = $$new_props.$$scope);
+    	};
+
+    	$$self.$capture_state = () => ({
+    		getContext,
+    		createEventDispatcher,
+    		ROUTER,
+    		LOCATION,
+    		navigate,
+    		startsWith,
+    		resolve,
+    		shouldNavigate,
+    		to,
+    		replace,
+    		state,
+    		getProps,
+    		base,
+    		location,
+    		dispatch,
+    		href,
+    		isPartiallyCurrent,
+    		isCurrent,
+    		props,
+    		onClick,
+    		ariaCurrent,
+    		$location,
+    		$base
+    	});
+
+    	$$self.$inject_state = $$new_props => {
+    		if ('to' in $$props) $$invalidate(7, to = $$new_props.to);
+    		if ('replace' in $$props) $$invalidate(8, replace = $$new_props.replace);
+    		if ('state' in $$props) $$invalidate(9, state = $$new_props.state);
+    		if ('getProps' in $$props) $$invalidate(10, getProps = $$new_props.getProps);
+    		if ('href' in $$props) $$invalidate(0, href = $$new_props.href);
+    		if ('isPartiallyCurrent' in $$props) $$invalidate(11, isPartiallyCurrent = $$new_props.isPartiallyCurrent);
+    		if ('isCurrent' in $$props) $$invalidate(12, isCurrent = $$new_props.isCurrent);
+    		if ('props' in $$props) $$invalidate(1, props = $$new_props.props);
+    		if ('ariaCurrent' in $$props) $$invalidate(2, ariaCurrent = $$new_props.ariaCurrent);
+    	};
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	$$self.$$.update = () => {
+    		if ($$self.$$.dirty & /*to, $base*/ 16512) {
+    			$$invalidate(0, href = to === "/" ? $base.uri : resolve(to, $base.uri));
+    		}
+
+    		if ($$self.$$.dirty & /*$location, href*/ 8193) {
+    			$$invalidate(11, isPartiallyCurrent = startsWith($location.pathname, href));
+    		}
+
+    		if ($$self.$$.dirty & /*href, $location*/ 8193) {
+    			$$invalidate(12, isCurrent = href === $location.pathname);
+    		}
+
+    		if ($$self.$$.dirty & /*isCurrent*/ 4096) {
+    			$$invalidate(2, ariaCurrent = isCurrent ? "page" : undefined);
+    		}
+
+    		if ($$self.$$.dirty & /*getProps, $location, href, isPartiallyCurrent, isCurrent*/ 15361) {
+    			$$invalidate(1, props = getProps({
+    				location: $location,
+    				href,
+    				isPartiallyCurrent,
+    				isCurrent
+    			}));
+    		}
+    	};
+
+    	return [
+    		href,
+    		props,
+    		ariaCurrent,
+    		base,
+    		location,
+    		onClick,
+    		$$restProps,
+    		to,
+    		replace,
+    		state,
+    		getProps,
+    		isPartiallyCurrent,
+    		isCurrent,
+    		$location,
+    		$base,
+    		$$scope,
+    		slots
+    	];
+    }
+
+    class Link extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+
+    		init(this, options, instance$3, create_fragment$3, safe_not_equal, {
+    			to: 7,
+    			replace: 8,
+    			state: 9,
+    			getProps: 10
+    		});
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Link",
+    			options,
+    			id: create_fragment$3.name
+    		});
+    	}
+
+    	get to() {
+    		throw new Error("<Link>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set to(value) {
+    		throw new Error("<Link>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get replace() {
+    		throw new Error("<Link>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set replace(value) {
+    		throw new Error("<Link>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get state() {
+    		throw new Error("<Link>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set state(value) {
+    		throw new Error("<Link>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get getProps() {
+    		throw new Error("<Link>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set getProps(value) {
+    		throw new Error("<Link>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
     }
 
     /*! *****************************************************************************
@@ -1426,7 +3210,7 @@ var app = (function () {
     }
 
     const name$o = "@firebase/app";
-    const version$1 = "0.7.4";
+    const version$1 = "0.7.5";
 
     /**
      * @license
@@ -1493,7 +3277,7 @@ var app = (function () {
     const name$1 = "@firebase/firestore-compat";
 
     const name$p = "firebase";
-    const version$2 = "9.1.3";
+    const version$2 = "9.2.0";
 
     /**
      * @license
@@ -1605,6 +3389,18 @@ var app = (function () {
             _addComponent(app, component);
         }
         return true;
+    }
+    /**
+     *
+     * @param app - FirebaseApp instance
+     * @param name - service name
+     *
+     * @returns the provider for the service with the matching name
+     *
+     * @internal
+     */
+    function _getProvider(app, name) {
+        return app.container.getProvider(name);
     }
 
     /**
@@ -1756,6 +3552,42 @@ var app = (function () {
         return newApp;
     }
     /**
+     * Retrieves a {@link @firebase/app#FirebaseApp} instance.
+     *
+     * When called with no arguments, the default app is returned. When an app name
+     * is provided, the app corresponding to that name is returned.
+     *
+     * An exception is thrown if the app being retrieved has not yet been
+     * initialized.
+     *
+     * @example
+     * ```javascript
+     * // Return the default app
+     * const app = getApp();
+     * ```
+     *
+     * @example
+     * ```javascript
+     * // Return a named app
+     * const otherApp = getApp("otherApp");
+     * ```
+     *
+     * @param name - Optional name of the app to return. If no name is
+     *   provided, the default is `"[DEFAULT]"`.
+     *
+     * @returns The app corresponding to the provided app name.
+     *   If no app name is provided, the default app is returned.
+     *
+     * @public
+     */
+    function getApp(name = DEFAULT_ENTRY_NAME) {
+        const app = _apps.get(name);
+        if (!app) {
+            throw ERROR_FACTORY.create("no-app" /* NO_APP */, { appName: name });
+        }
+        return app;
+    }
+    /**
      * Registers a library's name and version for platform logging purposes.
      * @param library - Name of 1p or 3p library (e.g. firestore, angularfire)
      * @param version - Current version of that library.
@@ -1827,7 +3659,7 @@ var app = (function () {
     registerCoreComponents('');
 
     var name = "firebase";
-    var version = "9.1.3";
+    var version = "9.2.0";
 
     /**
      * @license
@@ -1847,24 +3679,6 @@ var app = (function () {
      */
     registerVersion(name, version, 'app');
 
-    // Import the functions you need from the SDKs you need
-    // TODO: Add SDKs for Firebase products that you want to use
-    // https://firebase.google.com/docs/web/setup#available-libraries
-
-    // Your web app's Firebase configuration
-    const firebaseConfig = {
-      apiKey: "AIzaSyBAeLvzZzgp9tjlOt9JhA_tGKQb6EV1qr0",
-      authDomain: "svelteproject-37390.firebaseapp.com",
-      projectId: "svelteproject-37390",
-      storageBucket: "svelteproject-37390.appspot.com",
-      messagingSenderId: "1030684667807",
-      appId: "1:1030684667807:web:043c60e633f6a5619e57aa"
-    };
-
-    // Initialize Firebase
-    initializeApp(firebaseConfig);
-    const db$1 = getFirestore();
-
     var commonjsGlobal = typeof globalThis !== 'undefined' ? globalThis : typeof window !== 'undefined' ? window : typeof global !== 'undefined' ? global : typeof self !== 'undefined' ? self : {};
 
     /*
@@ -1872,82 +3686,82 @@ var app = (function () {
      Copyright The Closure Library Authors.
      SPDX-License-Identifier: Apache-2.0
     */
-    var k,goog=goog||{},l=commonjsGlobal||self;function aa$1(){}function ba(a){var b=typeof a;b="object"!=b?b:a?Array.isArray(a)?"array":b:"null";return "array"==b||"object"==b&&"number"==typeof a.length}function p(a){var b=typeof a;return "object"==b&&null!=a||"function"==b}function da$1(a){return Object.prototype.hasOwnProperty.call(a,ea$1)&&a[ea$1]||(a[ea$1]=++fa$1)}var ea$1="closure_uid_"+(1E9*Math.random()>>>0),fa$1=0;function ha$1(a,b,c){return a.call.apply(a.bind,arguments)}
+    var k,goog=goog||{},l=commonjsGlobal||self;function aa(){}function ba$1(a){var b=typeof a;b="object"!=b?b:a?Array.isArray(a)?"array":b:"null";return "array"==b||"object"==b&&"number"==typeof a.length}function p(a){var b=typeof a;return "object"==b&&null!=a||"function"==b}function da$1(a){return Object.prototype.hasOwnProperty.call(a,ea)&&a[ea]||(a[ea]=++fa$1)}var ea="closure_uid_"+(1E9*Math.random()>>>0),fa$1=0;function ha$1(a,b,c){return a.call.apply(a.bind,arguments)}
     function ia$1(a,b,c){if(!a)throw Error();if(2<arguments.length){var d=Array.prototype.slice.call(arguments,2);return function(){var e=Array.prototype.slice.call(arguments);Array.prototype.unshift.apply(e,d);return a.apply(b,e)}}return function(){return a.apply(b,arguments)}}function q$1(a,b,c){Function.prototype.bind&&-1!=Function.prototype.bind.toString().indexOf("native code")?q$1=ha$1:q$1=ia$1;return q$1.apply(null,arguments)}
-    function ja$1(a,b){var c=Array.prototype.slice.call(arguments,1);return function(){var d=c.slice();d.push.apply(d,arguments);return a.apply(this,d)}}function t(a,b){function c(){}c.prototype=b.prototype;a.Z=b.prototype;a.prototype=new c;a.prototype.constructor=a;a.Vb=function(d,e,f){for(var h=Array(arguments.length-2),n=2;n<arguments.length;n++)h[n-2]=arguments[n];return b.prototype[e].apply(d,h)};}function v(){this.s=this.s;this.o=this.o;}var ka$1=0,la={};v.prototype.s=!1;v.prototype.na=function(){if(!this.s&&(this.s=!0,this.M(),0!=ka$1)){var a=da$1(this);delete la[a];}};v.prototype.M=function(){if(this.o)for(;this.o.length;)this.o.shift()();};const ma$1=Array.prototype.indexOf?function(a,b){return Array.prototype.indexOf.call(a,b,void 0)}:function(a,b){if("string"===typeof a)return "string"!==typeof b||1!=b.length?-1:a.indexOf(b,0);for(let c=0;c<a.length;c++)if(c in a&&a[c]===b)return c;return -1},na$1=Array.prototype.forEach?function(a,b,c){Array.prototype.forEach.call(a,b,c);}:function(a,b,c){const d=a.length,e="string"===typeof a?a.split(""):a;for(let f=0;f<d;f++)f in e&&b.call(c,e[f],f,a);};
-    function oa$1(a){a:{var b=pa$1;const c=a.length,d="string"===typeof a?a.split(""):a;for(let e=0;e<c;e++)if(e in d&&b.call(void 0,d[e],e,a)){b=e;break a}b=-1;}return 0>b?null:"string"===typeof a?a.charAt(b):a[b]}function qa(a){return Array.prototype.concat.apply([],arguments)}function ra$1(a){const b=a.length;if(0<b){const c=Array(b);for(let d=0;d<b;d++)c[d]=a[d];return c}return []}function sa$1(a){return /^[\s\xa0]*$/.test(a)}var ta$1=String.prototype.trim?function(a){return a.trim()}:function(a){return /^[\s\xa0]*([\s\S]*?)[\s\xa0]*$/.exec(a)[1]};function w(a,b){return -1!=a.indexOf(b)}function ua$1(a,b){return a<b?-1:a>b?1:0}var x$1;a:{var va=l.navigator;if(va){var wa$1=va.userAgent;if(wa$1){x$1=wa$1;break a}}x$1="";}function xa(a,b,c){for(const d in a)b.call(c,a[d],d,a);}function ya$1(a){const b={};for(const c in a)b[c]=a[c];return b}var za="constructor hasOwnProperty isPrototypeOf propertyIsEnumerable toLocaleString toString valueOf".split(" ");function Aa(a,b){let c,d;for(let e=1;e<arguments.length;e++){d=arguments[e];for(c in d)a[c]=d[c];for(let f=0;f<za.length;f++)c=za[f],Object.prototype.hasOwnProperty.call(d,c)&&(a[c]=d[c]);}}function Ca$1(a){Ca$1[" "](a);return a}Ca$1[" "]=aa$1;function Fa$1(a){var b=Ga$1;return Object.prototype.hasOwnProperty.call(b,9)?b[9]:b[9]=a(9)}var Ha=w(x$1,"Opera"),y=w(x$1,"Trident")||w(x$1,"MSIE"),Ia=w(x$1,"Edge"),Ja=Ia||y,Ka$1=w(x$1,"Gecko")&&!(w(x$1.toLowerCase(),"webkit")&&!w(x$1,"Edge"))&&!(w(x$1,"Trident")||w(x$1,"MSIE"))&&!w(x$1,"Edge"),La$1=w(x$1.toLowerCase(),"webkit")&&!w(x$1,"Edge");function Ma(){var a=l.document;return a?a.documentMode:void 0}var Na$1;
-    a:{var Oa="",Pa=function(){var a=x$1;if(Ka$1)return /rv:([^\);]+)(\)|;)/.exec(a);if(Ia)return /Edge\/([\d\.]+)/.exec(a);if(y)return /\b(?:MSIE|rv)[: ]([^\);]+)(\)|;)/.exec(a);if(La$1)return /WebKit\/(\S+)/.exec(a);if(Ha)return /(?:Version)[ \/]?(\S+)/.exec(a)}();Pa&&(Oa=Pa?Pa[1]:"");if(y){var Qa$1=Ma();if(null!=Qa$1&&Qa$1>parseFloat(Oa)){Na$1=String(Qa$1);break a}}Na$1=Oa;}var Ga$1={};
-    function Ra(){return Fa$1(function(){let a=0;const b=ta$1(String(Na$1)).split("."),c=ta$1("9").split("."),d=Math.max(b.length,c.length);for(let h=0;0==a&&h<d;h++){var e=b[h]||"",f=c[h]||"";do{e=/(\d*)(\D*)(.*)/.exec(e)||["","","",""];f=/(\d*)(\D*)(.*)/.exec(f)||["","","",""];if(0==e[0].length&&0==f[0].length)break;a=ua$1(0==e[1].length?0:parseInt(e[1],10),0==f[1].length?0:parseInt(f[1],10))||ua$1(0==e[2].length,0==f[2].length)||ua$1(e[2],f[2]);e=e[3];f=f[3];}while(0==a)}return 0<=a})}var Sa;
-    if(l.document&&y){var Ta$1=Ma();Sa=Ta$1?Ta$1:parseInt(Na$1,10)||void 0;}else Sa=void 0;var Ua=Sa;var Va=function(){if(!l.addEventListener||!Object.defineProperty)return !1;var a=!1,b=Object.defineProperty({},"passive",{get:function(){a=!0;}});try{l.addEventListener("test",aa$1,b),l.removeEventListener("test",aa$1,b);}catch(c){}return a}();function z(a,b){this.type=a;this.g=this.target=b;this.defaultPrevented=!1;}z.prototype.h=function(){this.defaultPrevented=!0;};function A(a,b){z.call(this,a?a.type:"");this.relatedTarget=this.g=this.target=null;this.button=this.screenY=this.screenX=this.clientY=this.clientX=0;this.key="";this.metaKey=this.shiftKey=this.altKey=this.ctrlKey=!1;this.state=null;this.pointerId=0;this.pointerType="";this.i=null;if(a){var c=this.type=a.type,d=a.changedTouches&&a.changedTouches.length?a.changedTouches[0]:null;this.target=a.target||a.srcElement;this.g=b;if(b=a.relatedTarget){if(Ka$1){a:{try{Ca$1(b.nodeName);var e=!0;break a}catch(f){}e=
+    function ja(a,b){var c=Array.prototype.slice.call(arguments,1);return function(){var d=c.slice();d.push.apply(d,arguments);return a.apply(this,d)}}function t(a,b){function c(){}c.prototype=b.prototype;a.Z=b.prototype;a.prototype=new c;a.prototype.constructor=a;a.Vb=function(d,e,f){for(var h=Array(arguments.length-2),n=2;n<arguments.length;n++)h[n-2]=arguments[n];return b.prototype[e].apply(d,h)};}function v(){this.s=this.s;this.o=this.o;}var ka$1=0,la$1={};v.prototype.s=!1;v.prototype.na=function(){if(!this.s&&(this.s=!0,this.M(),0!=ka$1)){var a=da$1(this);delete la$1[a];}};v.prototype.M=function(){if(this.o)for(;this.o.length;)this.o.shift()();};const ma$1=Array.prototype.indexOf?function(a,b){return Array.prototype.indexOf.call(a,b,void 0)}:function(a,b){if("string"===typeof a)return "string"!==typeof b||1!=b.length?-1:a.indexOf(b,0);for(let c=0;c<a.length;c++)if(c in a&&a[c]===b)return c;return -1},na=Array.prototype.forEach?function(a,b,c){Array.prototype.forEach.call(a,b,c);}:function(a,b,c){const d=a.length,e="string"===typeof a?a.split(""):a;for(let f=0;f<d;f++)f in e&&b.call(c,e[f],f,a);};
+    function oa(a){a:{var b=pa$1;const c=a.length,d="string"===typeof a?a.split(""):a;for(let e=0;e<c;e++)if(e in d&&b.call(void 0,d[e],e,a)){b=e;break a}b=-1;}return 0>b?null:"string"===typeof a?a.charAt(b):a[b]}function qa(a){return Array.prototype.concat.apply([],arguments)}function ra(a){const b=a.length;if(0<b){const c=Array(b);for(let d=0;d<b;d++)c[d]=a[d];return c}return []}function sa(a){return /^[\s\xa0]*$/.test(a)}var ta=String.prototype.trim?function(a){return a.trim()}:function(a){return /^[\s\xa0]*([\s\S]*?)[\s\xa0]*$/.exec(a)[1]};function w(a,b){return -1!=a.indexOf(b)}function ua$1(a,b){return a<b?-1:a>b?1:0}var x$1;a:{var va$1=l.navigator;if(va$1){var wa$1=va$1.userAgent;if(wa$1){x$1=wa$1;break a}}x$1="";}function xa(a,b,c){for(const d in a)b.call(c,a[d],d,a);}function ya(a){const b={};for(const c in a)b[c]=a[c];return b}var za="constructor hasOwnProperty isPrototypeOf propertyIsEnumerable toLocaleString toString valueOf".split(" ");function Aa$1(a,b){let c,d;for(let e=1;e<arguments.length;e++){d=arguments[e];for(c in d)a[c]=d[c];for(let f=0;f<za.length;f++)c=za[f],Object.prototype.hasOwnProperty.call(d,c)&&(a[c]=d[c]);}}function Ca(a){Ca[" "](a);return a}Ca[" "]=aa;function Fa$1(a){var b=Ga;return Object.prototype.hasOwnProperty.call(b,9)?b[9]:b[9]=a(9)}var Ha=w(x$1,"Opera"),y=w(x$1,"Trident")||w(x$1,"MSIE"),Ia$1=w(x$1,"Edge"),Ja$1=Ia$1||y,Ka=w(x$1,"Gecko")&&!(w(x$1.toLowerCase(),"webkit")&&!w(x$1,"Edge"))&&!(w(x$1,"Trident")||w(x$1,"MSIE"))&&!w(x$1,"Edge"),La=w(x$1.toLowerCase(),"webkit")&&!w(x$1,"Edge");function Ma$1(){var a=l.document;return a?a.documentMode:void 0}var Na;
+    a:{var Oa$1="",Pa=function(){var a=x$1;if(Ka)return /rv:([^\);]+)(\)|;)/.exec(a);if(Ia$1)return /Edge\/([\d\.]+)/.exec(a);if(y)return /\b(?:MSIE|rv)[: ]([^\);]+)(\)|;)/.exec(a);if(La)return /WebKit\/(\S+)/.exec(a);if(Ha)return /(?:Version)[ \/]?(\S+)/.exec(a)}();Pa&&(Oa$1=Pa?Pa[1]:"");if(y){var Qa=Ma$1();if(null!=Qa&&Qa>parseFloat(Oa$1)){Na=String(Qa);break a}}Na=Oa$1;}var Ga={};
+    function Ra$1(){return Fa$1(function(){let a=0;const b=ta(String(Na)).split("."),c=ta("9").split("."),d=Math.max(b.length,c.length);for(let h=0;0==a&&h<d;h++){var e=b[h]||"",f=c[h]||"";do{e=/(\d*)(\D*)(.*)/.exec(e)||["","","",""];f=/(\d*)(\D*)(.*)/.exec(f)||["","","",""];if(0==e[0].length&&0==f[0].length)break;a=ua$1(0==e[1].length?0:parseInt(e[1],10),0==f[1].length?0:parseInt(f[1],10))||ua$1(0==e[2].length,0==f[2].length)||ua$1(e[2],f[2]);e=e[3];f=f[3];}while(0==a)}return 0<=a})}var Sa;
+    if(l.document&&y){var Ta$1=Ma$1();Sa=Ta$1?Ta$1:parseInt(Na,10)||void 0;}else Sa=void 0;var Ua=Sa;var Va=function(){if(!l.addEventListener||!Object.defineProperty)return !1;var a=!1,b=Object.defineProperty({},"passive",{get:function(){a=!0;}});try{l.addEventListener("test",aa,b),l.removeEventListener("test",aa,b);}catch(c){}return a}();function z(a,b){this.type=a;this.g=this.target=b;this.defaultPrevented=!1;}z.prototype.h=function(){this.defaultPrevented=!0;};function A(a,b){z.call(this,a?a.type:"");this.relatedTarget=this.g=this.target=null;this.button=this.screenY=this.screenX=this.clientY=this.clientX=0;this.key="";this.metaKey=this.shiftKey=this.altKey=this.ctrlKey=!1;this.state=null;this.pointerId=0;this.pointerType="";this.i=null;if(a){var c=this.type=a.type,d=a.changedTouches&&a.changedTouches.length?a.changedTouches[0]:null;this.target=a.target||a.srcElement;this.g=b;if(b=a.relatedTarget){if(Ka){a:{try{Ca(b.nodeName);var e=!0;break a}catch(f){}e=
     !1;}e||(b=null);}}else "mouseover"==c?b=a.fromElement:"mouseout"==c&&(b=a.toElement);this.relatedTarget=b;d?(this.clientX=void 0!==d.clientX?d.clientX:d.pageX,this.clientY=void 0!==d.clientY?d.clientY:d.pageY,this.screenX=d.screenX||0,this.screenY=d.screenY||0):(this.clientX=void 0!==a.clientX?a.clientX:a.pageX,this.clientY=void 0!==a.clientY?a.clientY:a.pageY,this.screenX=a.screenX||0,this.screenY=a.screenY||0);this.button=a.button;this.key=a.key||"";this.ctrlKey=a.ctrlKey;this.altKey=a.altKey;this.shiftKey=
-    a.shiftKey;this.metaKey=a.metaKey;this.pointerId=a.pointerId||0;this.pointerType="string"===typeof a.pointerType?a.pointerType:Wa$1[a.pointerType]||"";this.state=a.state;this.i=a;a.defaultPrevented&&A.Z.h.call(this);}}t(A,z);var Wa$1={2:"touch",3:"pen",4:"mouse"};A.prototype.h=function(){A.Z.h.call(this);var a=this.i;a.preventDefault?a.preventDefault():a.returnValue=!1;};var B$1="closure_listenable_"+(1E6*Math.random()|0);var Xa$1=0;function Ya$1(a,b,c,d,e){this.listener=a;this.proxy=null;this.src=b;this.type=c;this.capture=!!d;this.ia=e;this.key=++Xa$1;this.ca=this.fa=!1;}function Za(a){a.ca=!0;a.listener=null;a.proxy=null;a.src=null;a.ia=null;}function $a(a){this.src=a;this.g={};this.h=0;}$a.prototype.add=function(a,b,c,d,e){var f=a.toString();a=this.g[f];a||(a=this.g[f]=[],this.h++);var h=ab(a,b,d,e);-1<h?(b=a[h],c||(b.fa=!1)):(b=new Ya$1(b,this.src,f,!!d,e),b.fa=c,a.push(b));return b};function bb(a,b){var c=b.type;if(c in a.g){var d=a.g[c],e=ma$1(d,b),f;(f=0<=e)&&Array.prototype.splice.call(d,e,1);f&&(Za(b),0==a.g[c].length&&(delete a.g[c],a.h--));}}
-    function ab(a,b,c,d){for(var e=0;e<a.length;++e){var f=a[e];if(!f.ca&&f.listener==b&&f.capture==!!c&&f.ia==d)return e}return -1}var cb="closure_lm_"+(1E6*Math.random()|0),db={};function fb(a,b,c,d,e){if(d&&d.once)return gb(a,b,c,d,e);if(Array.isArray(b)){for(var f=0;f<b.length;f++)fb(a,b[f],c,d,e);return null}c=hb(c);return a&&a[B$1]?a.N(b,c,p(d)?!!d.capture:!!d,e):ib(a,b,c,!1,d,e)}
+    a.shiftKey;this.metaKey=a.metaKey;this.pointerId=a.pointerId||0;this.pointerType="string"===typeof a.pointerType?a.pointerType:Wa[a.pointerType]||"";this.state=a.state;this.i=a;a.defaultPrevented&&A.Z.h.call(this);}}t(A,z);var Wa={2:"touch",3:"pen",4:"mouse"};A.prototype.h=function(){A.Z.h.call(this);var a=this.i;a.preventDefault?a.preventDefault():a.returnValue=!1;};var B$1="closure_listenable_"+(1E6*Math.random()|0);var Xa$1=0;function Ya(a,b,c,d,e){this.listener=a;this.proxy=null;this.src=b;this.type=c;this.capture=!!d;this.ia=e;this.key=++Xa$1;this.ca=this.fa=!1;}function Za$1(a){a.ca=!0;a.listener=null;a.proxy=null;a.src=null;a.ia=null;}function $a(a){this.src=a;this.g={};this.h=0;}$a.prototype.add=function(a,b,c,d,e){var f=a.toString();a=this.g[f];a||(a=this.g[f]=[],this.h++);var h=ab(a,b,d,e);-1<h?(b=a[h],c||(b.fa=!1)):(b=new Ya(b,this.src,f,!!d,e),b.fa=c,a.push(b));return b};function bb(a,b){var c=b.type;if(c in a.g){var d=a.g[c],e=ma$1(d,b),f;(f=0<=e)&&Array.prototype.splice.call(d,e,1);f&&(Za$1(b),0==a.g[c].length&&(delete a.g[c],a.h--));}}
+    function ab(a,b,c,d){for(var e=0;e<a.length;++e){var f=a[e];if(!f.ca&&f.listener==b&&f.capture==!!c&&f.ia==d)return e}return -1}var cb="closure_lm_"+(1E6*Math.random()|0),db$1={};function fb(a,b,c,d,e){if(d&&d.once)return gb(a,b,c,d,e);if(Array.isArray(b)){for(var f=0;f<b.length;f++)fb(a,b[f],c,d,e);return null}c=hb(c);return a&&a[B$1]?a.N(b,c,p(d)?!!d.capture:!!d,e):ib(a,b,c,!1,d,e)}
     function ib(a,b,c,d,e,f){if(!b)throw Error("Invalid event type");var h=p(e)?!!e.capture:!!e,n=jb(a);n||(a[cb]=n=new $a(a));c=n.add(b,c,d,h,f);if(c.proxy)return c;d=kb();c.proxy=d;d.src=a;d.listener=c;if(a.addEventListener)Va||(e=h),void 0===e&&(e=!1),a.addEventListener(b.toString(),d,e);else if(a.attachEvent)a.attachEvent(lb(b.toString()),d);else if(a.addListener&&a.removeListener)a.addListener(d);else throw Error("addEventListener and attachEvent are unavailable.");return c}
     function kb(){function a(c){return b.call(a.src,a.listener,c)}var b=mb;return a}function gb(a,b,c,d,e){if(Array.isArray(b)){for(var f=0;f<b.length;f++)gb(a,b[f],c,d,e);return null}c=hb(c);return a&&a[B$1]?a.O(b,c,p(d)?!!d.capture:!!d,e):ib(a,b,c,!0,d,e)}
-    function nb(a,b,c,d,e){if(Array.isArray(b))for(var f=0;f<b.length;f++)nb(a,b[f],c,d,e);else (d=p(d)?!!d.capture:!!d,c=hb(c),a&&a[B$1])?(a=a.i,b=String(b).toString(),b in a.g&&(f=a.g[b],c=ab(f,c,d,e),-1<c&&(Za(f[c]),Array.prototype.splice.call(f,c,1),0==f.length&&(delete a.g[b],a.h--)))):a&&(a=jb(a))&&(b=a.g[b.toString()],a=-1,b&&(a=ab(b,c,d,e)),(c=-1<a?b[a]:null)&&ob(c));}
-    function ob(a){if("number"!==typeof a&&a&&!a.ca){var b=a.src;if(b&&b[B$1])bb(b.i,a);else {var c=a.type,d=a.proxy;b.removeEventListener?b.removeEventListener(c,d,a.capture):b.detachEvent?b.detachEvent(lb(c),d):b.addListener&&b.removeListener&&b.removeListener(d);(c=jb(b))?(bb(c,a),0==c.h&&(c.src=null,b[cb]=null)):Za(a);}}}function lb(a){return a in db?db[a]:db[a]="on"+a}function mb(a,b){if(a.ca)a=!0;else {b=new A(b,this);var c=a.listener,d=a.ia||a.src;a.fa&&ob(a);a=c.call(d,b);}return a}
+    function nb(a,b,c,d,e){if(Array.isArray(b))for(var f=0;f<b.length;f++)nb(a,b[f],c,d,e);else (d=p(d)?!!d.capture:!!d,c=hb(c),a&&a[B$1])?(a=a.i,b=String(b).toString(),b in a.g&&(f=a.g[b],c=ab(f,c,d,e),-1<c&&(Za$1(f[c]),Array.prototype.splice.call(f,c,1),0==f.length&&(delete a.g[b],a.h--)))):a&&(a=jb(a))&&(b=a.g[b.toString()],a=-1,b&&(a=ab(b,c,d,e)),(c=-1<a?b[a]:null)&&ob(c));}
+    function ob(a){if("number"!==typeof a&&a&&!a.ca){var b=a.src;if(b&&b[B$1])bb(b.i,a);else {var c=a.type,d=a.proxy;b.removeEventListener?b.removeEventListener(c,d,a.capture):b.detachEvent?b.detachEvent(lb(c),d):b.addListener&&b.removeListener&&b.removeListener(d);(c=jb(b))?(bb(c,a),0==c.h&&(c.src=null,b[cb]=null)):Za$1(a);}}}function lb(a){return a in db$1?db$1[a]:db$1[a]="on"+a}function mb(a,b){if(a.ca)a=!0;else {b=new A(b,this);var c=a.listener,d=a.ia||a.src;a.fa&&ob(a);a=c.call(d,b);}return a}
     function jb(a){a=a[cb];return a instanceof $a?a:null}var pb="__closure_events_fn_"+(1E9*Math.random()>>>0);function hb(a){if("function"===typeof a)return a;a[pb]||(a[pb]=function(b){return a.handleEvent(b)});return a[pb]}function C$1(){v.call(this);this.i=new $a(this);this.P=this;this.I=null;}t(C$1,v);C$1.prototype[B$1]=!0;C$1.prototype.removeEventListener=function(a,b,c,d){nb(this,a,b,c,d);};
-    function D$1(a,b){var c,d=a.I;if(d)for(c=[];d;d=d.I)c.push(d);a=a.P;d=b.type||b;if("string"===typeof b)b=new z(b,a);else if(b instanceof z)b.target=b.target||a;else {var e=b;b=new z(d,a);Aa(b,e);}e=!0;if(c)for(var f=c.length-1;0<=f;f--){var h=b.g=c[f];e=qb(h,d,!0,b)&&e;}h=b.g=a;e=qb(h,d,!0,b)&&e;e=qb(h,d,!1,b)&&e;if(c)for(f=0;f<c.length;f++)h=b.g=c[f],e=qb(h,d,!1,b)&&e;}
-    C$1.prototype.M=function(){C$1.Z.M.call(this);if(this.i){var a=this.i,c;for(c in a.g){for(var d=a.g[c],e=0;e<d.length;e++)Za(d[e]);delete a.g[c];a.h--;}}this.I=null;};C$1.prototype.N=function(a,b,c,d){return this.i.add(String(a),b,!1,c,d)};C$1.prototype.O=function(a,b,c,d){return this.i.add(String(a),b,!0,c,d)};
+    function D$1(a,b){var c,d=a.I;if(d)for(c=[];d;d=d.I)c.push(d);a=a.P;d=b.type||b;if("string"===typeof b)b=new z(b,a);else if(b instanceof z)b.target=b.target||a;else {var e=b;b=new z(d,a);Aa$1(b,e);}e=!0;if(c)for(var f=c.length-1;0<=f;f--){var h=b.g=c[f];e=qb(h,d,!0,b)&&e;}h=b.g=a;e=qb(h,d,!0,b)&&e;e=qb(h,d,!1,b)&&e;if(c)for(f=0;f<c.length;f++)h=b.g=c[f],e=qb(h,d,!1,b)&&e;}
+    C$1.prototype.M=function(){C$1.Z.M.call(this);if(this.i){var a=this.i,c;for(c in a.g){for(var d=a.g[c],e=0;e<d.length;e++)Za$1(d[e]);delete a.g[c];a.h--;}}this.I=null;};C$1.prototype.N=function(a,b,c,d){return this.i.add(String(a),b,!1,c,d)};C$1.prototype.O=function(a,b,c,d){return this.i.add(String(a),b,!0,c,d)};
     function qb(a,b,c,d){b=a.i.g[String(b)];if(!b)return !0;b=b.concat();for(var e=!0,f=0;f<b.length;++f){var h=b[f];if(h&&!h.ca&&h.capture==c){var n=h.listener,u=h.ia||h.src;h.fa&&bb(a.i,h);e=!1!==n.call(u,d)&&e;}}return e&&!d.defaultPrevented}var rb=l.JSON.stringify;function sb(){var a=tb;let b=null;a.g&&(b=a.g,a.g=a.g.next,a.g||(a.h=null),b.next=null);return b}class ub{constructor(){this.h=this.g=null;}add(a,b){const c=vb.get();c.set(a,b);this.h?this.h.next=c:this.g=c;this.h=c;}}var vb=new class{constructor(a,b){this.i=a;this.j=b;this.h=0;this.g=null;}get(){let a;0<this.h?(this.h--,a=this.g,this.g=a.next,a.next=null):a=this.i();return a}}(()=>new wb,a=>a.reset());
     class wb{constructor(){this.next=this.g=this.h=null;}set(a,b){this.h=a;this.g=b;this.next=null;}reset(){this.next=this.g=this.h=null;}}function yb(a){l.setTimeout(()=>{throw a;},0);}function zb(a,b){Ab||Bb();Cb||(Ab(),Cb=!0);tb.add(a,b);}var Ab;function Bb(){var a=l.Promise.resolve(void 0);Ab=function(){a.then(Db);};}var Cb=!1,tb=new ub;function Db(){for(var a;a=sb();){try{a.h.call(a.g);}catch(c){yb(c);}var b=vb;b.j(a);100>b.h&&(b.h++,a.next=b.g,b.g=a);}Cb=!1;}function Eb(a,b){C$1.call(this);this.h=a||1;this.g=b||l;this.j=q$1(this.kb,this);this.l=Date.now();}t(Eb,C$1);k=Eb.prototype;k.da=!1;k.S=null;k.kb=function(){if(this.da){var a=Date.now()-this.l;0<a&&a<.8*this.h?this.S=this.g.setTimeout(this.j,this.h-a):(this.S&&(this.g.clearTimeout(this.S),this.S=null),D$1(this,"tick"),this.da&&(Fb(this),this.start()));}};k.start=function(){this.da=!0;this.S||(this.S=this.g.setTimeout(this.j,this.h),this.l=Date.now());};
     function Fb(a){a.da=!1;a.S&&(a.g.clearTimeout(a.S),a.S=null);}k.M=function(){Eb.Z.M.call(this);Fb(this);delete this.g;};function Gb(a,b,c){if("function"===typeof a)c&&(a=q$1(a,c));else if(a&&"function"==typeof a.handleEvent)a=q$1(a.handleEvent,a);else throw Error("Invalid listener argument");return 2147483647<Number(b)?-1:l.setTimeout(a,b||0)}function Hb(a){a.g=Gb(()=>{a.g=null;a.i&&(a.i=!1,Hb(a));},a.j);const b=a.h;a.h=null;a.m.apply(null,b);}class Ib extends v{constructor(a,b){super();this.m=a;this.j=b;this.h=null;this.i=!1;this.g=null;}l(a){this.h=arguments;this.g?this.i=!0:Hb(this);}M(){super.M();this.g&&(l.clearTimeout(this.g),this.g=null,this.i=!1,this.h=null);}}function E(a){v.call(this);this.h=a;this.g={};}t(E,v);var Jb=[];function Kb(a,b,c,d){Array.isArray(c)||(c&&(Jb[0]=c.toString()),c=Jb);for(var e=0;e<c.length;e++){var f=fb(b,c[e],d||a.handleEvent,!1,a.h||a);if(!f)break;a.g[f.key]=f;}}function Lb(a){xa(a.g,function(b,c){this.g.hasOwnProperty(c)&&ob(b);},a);a.g={};}E.prototype.M=function(){E.Z.M.call(this);Lb(this);};E.prototype.handleEvent=function(){throw Error("EventHandler.handleEvent not implemented");};function Mb(){this.g=!0;}Mb.prototype.Aa=function(){this.g=!1;};function Nb(a,b,c,d,e,f){a.info(function(){if(a.g)if(f){var h="";for(var n=f.split("&"),u=0;u<n.length;u++){var m=n[u].split("=");if(1<m.length){var r=m[0];m=m[1];var G=r.split("_");h=2<=G.length&&"type"==G[1]?h+(r+"="+m+"&"):h+(r+"=redacted&");}}}else h=null;else h=f;return "XMLHTTP REQ ("+d+") [attempt "+e+"]: "+b+"\n"+c+"\n"+h});}
     function Ob(a,b,c,d,e,f,h){a.info(function(){return "XMLHTTP RESP ("+d+") [ attempt "+e+"]: "+b+"\n"+c+"\n"+f+" "+h});}function F$1(a,b,c,d){a.info(function(){return "XMLHTTP TEXT ("+b+"): "+Pb(a,c)+(d?" "+d:"")});}function Qb(a,b){a.info(function(){return "TIMEOUT: "+b});}Mb.prototype.info=function(){};
     function Pb(a,b){if(!a.g)return b;if(!b)return null;try{var c=JSON.parse(b);if(c)for(a=0;a<c.length;a++)if(Array.isArray(c[a])){var d=c[a];if(!(2>d.length)){var e=d[1];if(Array.isArray(e)&&!(1>e.length)){var f=e[0];if("noop"!=f&&"stop"!=f&&"close"!=f)for(var h=1;h<e.length;h++)e[h]="";}}}return rb(c)}catch(n){return b}}var H$1={},Rb=null;function Sb(){return Rb=Rb||new C$1}H$1.Ma="serverreachability";function Tb(a){z.call(this,H$1.Ma,a);}t(Tb,z);function I(a){const b=Sb();D$1(b,new Tb(b,a));}H$1.STAT_EVENT="statevent";function Ub(a,b){z.call(this,H$1.STAT_EVENT,a);this.stat=b;}t(Ub,z);function J$1(a){const b=Sb();D$1(b,new Ub(b,a));}H$1.Na="timingevent";function Vb(a,b){z.call(this,H$1.Na,a);this.size=b;}t(Vb,z);
-    function K$1(a,b){if("function"!==typeof a)throw Error("Fn must not be null and must be a function");return l.setTimeout(function(){a();},b)}var Wb={NO_ERROR:0,lb:1,yb:2,xb:3,sb:4,wb:5,zb:6,Ja:7,TIMEOUT:8,Cb:9};var Xb={qb:"complete",Mb:"success",Ka:"error",Ja:"abort",Eb:"ready",Fb:"readystatechange",TIMEOUT:"timeout",Ab:"incrementaldata",Db:"progress",tb:"downloadprogress",Ub:"uploadprogress"};function Yb(){}Yb.prototype.h=null;function Zb(a){return a.h||(a.h=a.i())}function $b(){}var L$1={OPEN:"a",pb:"b",Ka:"c",Bb:"d"};function ac(){z.call(this,"d");}t(ac,z);function bc$1(){z.call(this,"c");}t(bc$1,z);var cc;function dc$1(){}t(dc$1,Yb);dc$1.prototype.g=function(){return new XMLHttpRequest};dc$1.prototype.i=function(){return {}};cc=new dc$1;function M$1(a,b,c,d){this.l=a;this.j=b;this.m=c;this.X=d||1;this.V=new E(this);this.P=ec;a=Ja?125:void 0;this.W=new Eb(a);this.H=null;this.i=!1;this.s=this.A=this.v=this.K=this.F=this.Y=this.B=null;this.D=[];this.g=null;this.C=0;this.o=this.u=null;this.N=-1;this.I=!1;this.O=0;this.L=null;this.aa=this.J=this.$=this.U=!1;this.h=new fc$1;}function fc$1(){this.i=null;this.g="";this.h=!1;}var ec=45E3,gc$1={},hc$1={};k=M$1.prototype;k.setTimeout=function(a){this.P=a;};
-    function ic$1(a,b,c){a.K=1;a.v=jc(N$1(b));a.s=c;a.U=!0;kc$1(a,null);}function kc$1(a,b){a.F=Date.now();lc$1(a);a.A=N$1(a.v);var c=a.A,d=a.X;Array.isArray(d)||(d=[String(d)]);mc$1(c.h,"t",d);a.C=0;c=a.l.H;a.h=new fc$1;a.g=nc(a.l,c?b:null,!a.s);0<a.O&&(a.L=new Ib(q$1(a.Ia,a,a.g),a.O));Kb(a.V,a.g,"readystatechange",a.gb);b=a.H?ya$1(a.H):{};a.s?(a.u||(a.u="POST"),b["Content-Type"]="application/x-www-form-urlencoded",a.g.ea(a.A,a.u,a.s,b)):(a.u="GET",a.g.ea(a.A,a.u,null,b));I(1);Nb(a.j,a.u,a.A,a.m,a.X,a.s);}
+    function K$1(a,b){if("function"!==typeof a)throw Error("Fn must not be null and must be a function");return l.setTimeout(function(){a();},b)}var Wb={NO_ERROR:0,lb:1,yb:2,xb:3,sb:4,wb:5,zb:6,Ja:7,TIMEOUT:8,Cb:9};var Xb={qb:"complete",Mb:"success",Ka:"error",Ja:"abort",Eb:"ready",Fb:"readystatechange",TIMEOUT:"timeout",Ab:"incrementaldata",Db:"progress",tb:"downloadprogress",Ub:"uploadprogress"};function Yb(){}Yb.prototype.h=null;function Zb(a){return a.h||(a.h=a.i())}function $b(){}var L$1={OPEN:"a",pb:"b",Ka:"c",Bb:"d"};function ac$1(){z.call(this,"d");}t(ac$1,z);function bc(){z.call(this,"c");}t(bc,z);var cc$1;function dc$1(){}t(dc$1,Yb);dc$1.prototype.g=function(){return new XMLHttpRequest};dc$1.prototype.i=function(){return {}};cc$1=new dc$1;function M$1(a,b,c,d){this.l=a;this.j=b;this.m=c;this.X=d||1;this.V=new E(this);this.P=ec$1;a=Ja$1?125:void 0;this.W=new Eb(a);this.H=null;this.i=!1;this.s=this.A=this.v=this.K=this.F=this.Y=this.B=null;this.D=[];this.g=null;this.C=0;this.o=this.u=null;this.N=-1;this.I=!1;this.O=0;this.L=null;this.aa=this.J=this.$=this.U=!1;this.h=new fc$1;}function fc$1(){this.i=null;this.g="";this.h=!1;}var ec$1=45E3,gc$1={},hc$1={};k=M$1.prototype;k.setTimeout=function(a){this.P=a;};
+    function ic$1(a,b,c){a.K=1;a.v=jc$1(N$1(b));a.s=c;a.U=!0;kc$1(a,null);}function kc$1(a,b){a.F=Date.now();lc(a);a.A=N$1(a.v);var c=a.A,d=a.X;Array.isArray(d)||(d=[String(d)]);mc$1(c.h,"t",d);a.C=0;c=a.l.H;a.h=new fc$1;a.g=nc$1(a.l,c?b:null,!a.s);0<a.O&&(a.L=new Ib(q$1(a.Ia,a,a.g),a.O));Kb(a.V,a.g,"readystatechange",a.gb);b=a.H?ya(a.H):{};a.s?(a.u||(a.u="POST"),b["Content-Type"]="application/x-www-form-urlencoded",a.g.ea(a.A,a.u,a.s,b)):(a.u="GET",a.g.ea(a.A,a.u,null,b));I(1);Nb(a.j,a.u,a.A,a.m,a.X,a.s);}
     k.gb=function(a){a=a.target;const b=this.L;b&&3==O$1(a)?b.l():this.Ia(a);};
-    k.Ia=function(a){try{if(a==this.g)a:{const r=O$1(this.g);var b=this.g.Da();const G=this.g.ba();if(!(3>r)&&(3!=r||Ja||this.g&&(this.h.h||this.g.ga()||oc(this.g)))){this.I||4!=r||7==b||(8==b||0>=G?I(3):I(2));pc$1(this);var c=this.g.ba();this.N=c;b:if(qc(this)){var d=oc(this.g);a="";var e=d.length,f=4==O$1(this.g);if(!this.h.i){if("undefined"===typeof TextDecoder){P(this);rc(this);var h="";break b}this.h.i=new l.TextDecoder;}for(b=0;b<e;b++)this.h.h=!0,a+=this.h.i.decode(d[b],{stream:f&&b==e-1});d.splice(0,
-    e);this.h.g+=a;this.C=0;h=this.h.g;}else h=this.g.ga();this.i=200==c;Ob(this.j,this.u,this.A,this.m,this.X,r,c);if(this.i){if(this.$&&!this.J){b:{if(this.g){var n,u=this.g;if((n=u.g?u.g.getResponseHeader("X-HTTP-Initial-Response"):null)&&!sa$1(n)){var m=n;break b}}m=null;}if(c=m)F$1(this.j,this.m,c,"Initial handshake response via X-HTTP-Initial-Response"),this.J=!0,sc(this,c);else {this.i=!1;this.o=3;J$1(12);P(this);rc(this);break a}}this.U?(tc(this,r,h),Ja&&this.i&&3==r&&(Kb(this.V,this.W,"tick",this.fb),
-    this.W.start())):(F$1(this.j,this.m,h,null),sc(this,h));4==r&&P(this);this.i&&!this.I&&(4==r?uc$1(this.l,this):(this.i=!1,lc$1(this)));}else 400==c&&0<h.indexOf("Unknown SID")?(this.o=3,J$1(12)):(this.o=0,J$1(13)),P(this),rc(this);}}}catch(r){}finally{}};function qc(a){return a.g?"GET"==a.u&&2!=a.K&&a.l.Ba:!1}
-    function tc(a,b,c){let d=!0,e;for(;!a.I&&a.C<c.length;)if(e=vc$1(a,c),e==hc$1){4==b&&(a.o=4,J$1(14),d=!1);F$1(a.j,a.m,null,"[Incomplete Response]");break}else if(e==gc$1){a.o=4;J$1(15);F$1(a.j,a.m,c,"[Invalid Chunk]");d=!1;break}else F$1(a.j,a.m,e,null),sc(a,e);qc(a)&&e!=hc$1&&e!=gc$1&&(a.h.g="",a.C=0);4!=b||0!=c.length||a.h.h||(a.o=1,J$1(16),d=!1);a.i=a.i&&d;d?0<c.length&&!a.aa&&(a.aa=!0,b=a.l,b.g==a&&b.$&&!b.L&&(b.h.info("Great, no buffering proxy detected. Bytes received: "+c.length),wc$1(b),b.L=!0,J$1(11))):(F$1(a.j,a.m,
-    c,"[Invalid Chunked Response]"),P(a),rc(a));}k.fb=function(){if(this.g){var a=O$1(this.g),b=this.g.ga();this.C<b.length&&(pc$1(this),tc(this,a,b),this.i&&4!=a&&lc$1(this));}};function vc$1(a,b){var c=a.C,d=b.indexOf("\n",c);if(-1==d)return hc$1;c=Number(b.substring(c,d));if(isNaN(c))return gc$1;d+=1;if(d+c>b.length)return hc$1;b=b.substr(d,c);a.C=d+c;return b}k.cancel=function(){this.I=!0;P(this);};function lc$1(a){a.Y=Date.now()+a.P;xc(a,a.P);}
-    function xc(a,b){if(null!=a.B)throw Error("WatchDog timer not null");a.B=K$1(q$1(a.eb,a),b);}function pc$1(a){a.B&&(l.clearTimeout(a.B),a.B=null);}k.eb=function(){this.B=null;const a=Date.now();0<=a-this.Y?(Qb(this.j,this.A),2!=this.K&&(I(3),J$1(17)),P(this),this.o=2,rc(this)):xc(this,this.Y-a);};function rc(a){0==a.l.G||a.I||uc$1(a.l,a);}function P(a){pc$1(a);var b=a.L;b&&"function"==typeof b.na&&b.na();a.L=null;Fb(a.W);Lb(a.V);a.g&&(b=a.g,a.g=null,b.abort(),b.na());}
-    function sc(a,b){try{var c=a.l;if(0!=c.G&&(c.g==a||yc(c.i,a)))if(c.I=a.N,!a.J&&yc(c.i,a)&&3==c.G){try{var d=c.Ca.g.parse(b);}catch(m){d=null;}if(Array.isArray(d)&&3==d.length){var e=d;if(0==e[0])a:{if(!c.u){if(c.g)if(c.g.F+3E3<a.F)zc(c),Ac$1(c);else break a;Bc(c);J$1(18);}}else c.ta=e[1],0<c.ta-c.U&&37500>e[2]&&c.N&&0==c.A&&!c.v&&(c.v=K$1(q$1(c.ab,c),6E3));if(1>=Cc(c.i)&&c.ka){try{c.ka();}catch(m){}c.ka=void 0;}}else Q$1(c,11);}else if((a.J||c.g==a)&&zc(c),!sa$1(b))for(e=c.Ca.g.parse(b),b=0;b<e.length;b++){let m=e[b];
-    c.U=m[0];m=m[1];if(2==c.G)if("c"==m[0]){c.J=m[1];c.la=m[2];const r=m[3];null!=r&&(c.ma=r,c.h.info("VER="+c.ma));const G=m[4];null!=G&&(c.za=G,c.h.info("SVER="+c.za));const Da=m[5];null!=Da&&"number"===typeof Da&&0<Da&&(d=1.5*Da,c.K=d,c.h.info("backChannelRequestTimeoutMs_="+d));d=c;const ca=a.g;if(ca){const Ea=ca.g?ca.g.getResponseHeader("X-Client-Wire-Protocol"):null;if(Ea){var f=d.i;!f.g&&(w(Ea,"spdy")||w(Ea,"quic")||w(Ea,"h2"))&&(f.j=f.l,f.g=new Set,f.h&&(Dc$1(f,f.h),f.h=null));}if(d.D){const xb=
-    ca.g?ca.g.getResponseHeader("X-HTTP-Session-Id"):null;xb&&(d.sa=xb,R(d.F,d.D,xb));}}c.G=3;c.j&&c.j.xa();c.$&&(c.O=Date.now()-a.F,c.h.info("Handshake RTT: "+c.O+"ms"));d=c;var h=a;d.oa=Ec(d,d.H?d.la:null,d.W);if(h.J){Fc$1(d.i,h);var n=h,u=d.K;u&&n.setTimeout(u);n.B&&(pc$1(n),lc$1(n));d.g=h;}else Gc(d);0<c.l.length&&Hc(c);}else "stop"!=m[0]&&"close"!=m[0]||Q$1(c,7);else 3==c.G&&("stop"==m[0]||"close"==m[0]?"stop"==m[0]?Q$1(c,7):Ic$1(c):"noop"!=m[0]&&c.j&&c.j.wa(m),c.A=0);}I(4);}catch(m){}}function Jc$1(a){if(a.R&&"function"==typeof a.R)return a.R();if("string"===typeof a)return a.split("");if(ba(a)){for(var b=[],c=a.length,d=0;d<c;d++)b.push(a[d]);return b}b=[];c=0;for(d in a)b[c++]=a[d];return b}
-    function Kc(a,b){if(a.forEach&&"function"==typeof a.forEach)a.forEach(b,void 0);else if(ba(a)||"string"===typeof a)na$1(a,b,void 0);else {if(a.T&&"function"==typeof a.T)var c=a.T();else if(a.R&&"function"==typeof a.R)c=void 0;else if(ba(a)||"string"===typeof a){c=[];for(var d=a.length,e=0;e<d;e++)c.push(e);}else for(e in c=[],d=0,a)c[d++]=e;d=Jc$1(a);e=d.length;for(var f=0;f<e;f++)b.call(void 0,d[f],c&&c[f],a);}}function S$1(a,b){this.h={};this.g=[];this.i=0;var c=arguments.length;if(1<c){if(c%2)throw Error("Uneven number of arguments");for(var d=0;d<c;d+=2)this.set(arguments[d],arguments[d+1]);}else if(a)if(a instanceof S$1)for(c=a.T(),d=0;d<c.length;d++)this.set(c[d],a.get(c[d]));else for(d in a)this.set(d,a[d]);}k=S$1.prototype;k.R=function(){Lc(this);for(var a=[],b=0;b<this.g.length;b++)a.push(this.h[this.g[b]]);return a};k.T=function(){Lc(this);return this.g.concat()};
-    function Lc(a){if(a.i!=a.g.length){for(var b=0,c=0;b<a.g.length;){var d=a.g[b];T(a.h,d)&&(a.g[c++]=d);b++;}a.g.length=c;}if(a.i!=a.g.length){var e={};for(c=b=0;b<a.g.length;)d=a.g[b],T(e,d)||(a.g[c++]=d,e[d]=1),b++;a.g.length=c;}}k.get=function(a,b){return T(this.h,a)?this.h[a]:b};k.set=function(a,b){T(this.h,a)||(this.i++,this.g.push(a));this.h[a]=b;};k.forEach=function(a,b){for(var c=this.T(),d=0;d<c.length;d++){var e=c[d],f=this.get(e);a.call(b,f,e,this);}};
-    function T(a,b){return Object.prototype.hasOwnProperty.call(a,b)}var Mc$1=/^(?:([^:/?#.]+):)?(?:\/\/(?:([^\\/?#]*)@)?([^\\/?#]*?)(?::([0-9]+))?(?=[\\/?#]|$))?([^?#]+)?(?:\?([^#]*))?(?:#([\s\S]*))?$/;function Nc(a,b){if(a){a=a.split("&");for(var c=0;c<a.length;c++){var d=a[c].indexOf("="),e=null;if(0<=d){var f=a[c].substring(0,d);e=a[c].substring(d+1);}else f=a[c];b(f,e?decodeURIComponent(e.replace(/\+/g," ")):"");}}}function U(a,b){this.i=this.s=this.j="";this.m=null;this.o=this.l="";this.g=!1;if(a instanceof U){this.g=void 0!==b?b:a.g;Oc(this,a.j);this.s=a.s;Pc(this,a.i);Qc(this,a.m);this.l=a.l;b=a.h;var c=new Rc$1;c.i=b.i;b.g&&(c.g=new S$1(b.g),c.h=b.h);Sc(this,c);this.o=a.o;}else a&&(c=String(a).match(Mc$1))?(this.g=!!b,Oc(this,c[1]||"",!0),this.s=Tc$1(c[2]||""),Pc(this,c[3]||"",!0),Qc(this,c[4]),this.l=Tc$1(c[5]||"",!0),Sc(this,c[6]||"",!0),this.o=Tc$1(c[7]||"")):(this.g=!!b,this.h=new Rc$1(null,this.g));}
-    U.prototype.toString=function(){var a=[],b=this.j;b&&a.push(Uc(b,Vc,!0),":");var c=this.i;if(c||"file"==b)a.push("//"),(b=this.s)&&a.push(Uc(b,Vc,!0),"@"),a.push(encodeURIComponent(String(c)).replace(/%25([0-9a-fA-F]{2})/g,"%$1")),c=this.m,null!=c&&a.push(":",String(c));if(c=this.l)this.i&&"/"!=c.charAt(0)&&a.push("/"),a.push(Uc(c,"/"==c.charAt(0)?Wc:Xc$1,!0));(c=this.h.toString())&&a.push("?",c);(c=this.o)&&a.push("#",Uc(c,Yc));return a.join("")};function N$1(a){return new U(a)}
-    function Oc(a,b,c){a.j=c?Tc$1(b,!0):b;a.j&&(a.j=a.j.replace(/:$/,""));}function Pc(a,b,c){a.i=c?Tc$1(b,!0):b;}function Qc(a,b){if(b){b=Number(b);if(isNaN(b)||0>b)throw Error("Bad port number "+b);a.m=b;}else a.m=null;}function Sc(a,b,c){b instanceof Rc$1?(a.h=b,Zc$1(a.h,a.g)):(c||(b=Uc(b,$c)),a.h=new Rc$1(b,a.g));}function R(a,b,c){a.h.set(b,c);}function jc(a){R(a,"zx",Math.floor(2147483648*Math.random()).toString(36)+Math.abs(Math.floor(2147483648*Math.random())^Date.now()).toString(36));return a}
-    function ad(a){return a instanceof U?N$1(a):new U(a,void 0)}function bd(a,b,c,d){var e=new U(null,void 0);a&&Oc(e,a);b&&Pc(e,b);c&&Qc(e,c);d&&(e.l=d);return e}function Tc$1(a,b){return a?b?decodeURI(a.replace(/%25/g,"%2525")):decodeURIComponent(a):""}function Uc(a,b,c){return "string"===typeof a?(a=encodeURI(a).replace(b,cd),c&&(a=a.replace(/%25([0-9a-fA-F]{2})/g,"%$1")),a):null}function cd(a){a=a.charCodeAt(0);return "%"+(a>>4&15).toString(16)+(a&15).toString(16)}
-    var Vc=/[#\/\?@]/g,Xc$1=/[#\?:]/g,Wc=/[#\?]/g,$c=/[#\?@]/g,Yc=/#/g;function Rc$1(a,b){this.h=this.g=null;this.i=a||null;this.j=!!b;}function V(a){a.g||(a.g=new S$1,a.h=0,a.i&&Nc(a.i,function(b,c){a.add(decodeURIComponent(b.replace(/\+/g," ")),c);}));}k=Rc$1.prototype;k.add=function(a,b){V(this);this.i=null;a=W$1(this,a);var c=this.g.get(a);c||this.g.set(a,c=[]);c.push(b);this.h+=1;return this};
-    function dd(a,b){V(a);b=W$1(a,b);T(a.g.h,b)&&(a.i=null,a.h-=a.g.get(b).length,a=a.g,T(a.h,b)&&(delete a.h[b],a.i--,a.g.length>2*a.i&&Lc(a)));}function ed(a,b){V(a);b=W$1(a,b);return T(a.g.h,b)}k.forEach=function(a,b){V(this);this.g.forEach(function(c,d){na$1(c,function(e){a.call(b,e,d,this);},this);},this);};k.T=function(){V(this);for(var a=this.g.R(),b=this.g.T(),c=[],d=0;d<b.length;d++)for(var e=a[d],f=0;f<e.length;f++)c.push(b[d]);return c};
-    k.R=function(a){V(this);var b=[];if("string"===typeof a)ed(this,a)&&(b=qa(b,this.g.get(W$1(this,a))));else {a=this.g.R();for(var c=0;c<a.length;c++)b=qa(b,a[c]);}return b};k.set=function(a,b){V(this);this.i=null;a=W$1(this,a);ed(this,a)&&(this.h-=this.g.get(a).length);this.g.set(a,[b]);this.h+=1;return this};k.get=function(a,b){if(!a)return b;a=this.R(a);return 0<a.length?String(a[0]):b};function mc$1(a,b,c){dd(a,b);0<c.length&&(a.i=null,a.g.set(W$1(a,b),ra$1(c)),a.h+=c.length);}
-    k.toString=function(){if(this.i)return this.i;if(!this.g)return "";for(var a=[],b=this.g.T(),c=0;c<b.length;c++){var d=b[c],e=encodeURIComponent(String(d));d=this.R(d);for(var f=0;f<d.length;f++){var h=e;""!==d[f]&&(h+="="+encodeURIComponent(String(d[f])));a.push(h);}}return this.i=a.join("&")};function W$1(a,b){b=String(b);a.j&&(b=b.toLowerCase());return b}function Zc$1(a,b){b&&!a.j&&(V(a),a.i=null,a.g.forEach(function(c,d){var e=d.toLowerCase();d!=e&&(dd(this,d),mc$1(this,e,c));},a));a.j=b;}var fd=class{constructor(a,b){this.h=a;this.g=b;}};function gd(a){this.l=a||hd;l.PerformanceNavigationTiming?(a=l.performance.getEntriesByType("navigation"),a=0<a.length&&("hq"==a[0].nextHopProtocol||"h2"==a[0].nextHopProtocol)):a=!!(l.g&&l.g.Ea&&l.g.Ea()&&l.g.Ea().Zb);this.j=a?this.l:1;this.g=null;1<this.j&&(this.g=new Set);this.h=null;this.i=[];}var hd=10;function id(a){return a.h?!0:a.g?a.g.size>=a.j:!1}function Cc(a){return a.h?1:a.g?a.g.size:0}function yc(a,b){return a.h?a.h==b:a.g?a.g.has(b):!1}function Dc$1(a,b){a.g?a.g.add(b):a.h=b;}
-    function Fc$1(a,b){a.h&&a.h==b?a.h=null:a.g&&a.g.has(b)&&a.g.delete(b);}gd.prototype.cancel=function(){this.i=jd(this);if(this.h)this.h.cancel(),this.h=null;else if(this.g&&0!==this.g.size){for(const a of this.g.values())a.cancel();this.g.clear();}};function jd(a){if(null!=a.h)return a.i.concat(a.h.D);if(null!=a.g&&0!==a.g.size){let b=a.i;for(const c of a.g.values())b=b.concat(c.D);return b}return ra$1(a.i)}function kd(){}kd.prototype.stringify=function(a){return l.JSON.stringify(a,void 0)};kd.prototype.parse=function(a){return l.JSON.parse(a,void 0)};function ld(){this.g=new kd;}function md(a,b,c){const d=c||"";try{Kc(a,function(e,f){let h=e;p(e)&&(h=rb(e));b.push(d+f+"="+encodeURIComponent(h));});}catch(e){throw b.push(d+"type="+encodeURIComponent("_badmap")),e;}}function nd(a,b){const c=new Mb;if(l.Image){const d=new Image;d.onload=ja$1(od,c,d,"TestLoadImage: loaded",!0,b);d.onerror=ja$1(od,c,d,"TestLoadImage: error",!1,b);d.onabort=ja$1(od,c,d,"TestLoadImage: abort",!1,b);d.ontimeout=ja$1(od,c,d,"TestLoadImage: timeout",!1,b);l.setTimeout(function(){if(d.ontimeout)d.ontimeout();},1E4);d.src=a;}else b(!1);}function od(a,b,c,d,e){try{b.onload=null,b.onerror=null,b.onabort=null,b.ontimeout=null,e(d);}catch(f){}}function pd(a){this.l=a.$b||null;this.j=a.ib||!1;}t(pd,Yb);pd.prototype.g=function(){return new qd(this.l,this.j)};pd.prototype.i=function(a){return function(){return a}}({});function qd(a,b){C$1.call(this);this.D=a;this.u=b;this.m=void 0;this.readyState=rd;this.status=0;this.responseType=this.responseText=this.response=this.statusText="";this.onreadystatechange=null;this.v=new Headers;this.h=null;this.C="GET";this.B="";this.g=!1;this.A=this.j=this.l=null;}t(qd,C$1);var rd=0;k=qd.prototype;
+    k.Ia=function(a){try{if(a==this.g)a:{const r=O$1(this.g);var b=this.g.Da();const G=this.g.ba();if(!(3>r)&&(3!=r||Ja$1||this.g&&(this.h.h||this.g.ga()||oc$1(this.g)))){this.I||4!=r||7==b||(8==b||0>=G?I(3):I(2));pc$1(this);var c=this.g.ba();this.N=c;b:if(qc(this)){var d=oc$1(this.g);a="";var e=d.length,f=4==O$1(this.g);if(!this.h.i){if("undefined"===typeof TextDecoder){P(this);rc$1(this);var h="";break b}this.h.i=new l.TextDecoder;}for(b=0;b<e;b++)this.h.h=!0,a+=this.h.i.decode(d[b],{stream:f&&b==e-1});d.splice(0,
+    e);this.h.g+=a;this.C=0;h=this.h.g;}else h=this.g.ga();this.i=200==c;Ob(this.j,this.u,this.A,this.m,this.X,r,c);if(this.i){if(this.$&&!this.J){b:{if(this.g){var n,u=this.g;if((n=u.g?u.g.getResponseHeader("X-HTTP-Initial-Response"):null)&&!sa(n)){var m=n;break b}}m=null;}if(c=m)F$1(this.j,this.m,c,"Initial handshake response via X-HTTP-Initial-Response"),this.J=!0,sc$1(this,c);else {this.i=!1;this.o=3;J$1(12);P(this);rc$1(this);break a}}this.U?(tc$1(this,r,h),Ja$1&&this.i&&3==r&&(Kb(this.V,this.W,"tick",this.fb),
+    this.W.start())):(F$1(this.j,this.m,h,null),sc$1(this,h));4==r&&P(this);this.i&&!this.I&&(4==r?uc$1(this.l,this):(this.i=!1,lc(this)));}else 400==c&&0<h.indexOf("Unknown SID")?(this.o=3,J$1(12)):(this.o=0,J$1(13)),P(this),rc$1(this);}}}catch(r){}finally{}};function qc(a){return a.g?"GET"==a.u&&2!=a.K&&a.l.Ba:!1}
+    function tc$1(a,b,c){let d=!0,e;for(;!a.I&&a.C<c.length;)if(e=vc(a,c),e==hc$1){4==b&&(a.o=4,J$1(14),d=!1);F$1(a.j,a.m,null,"[Incomplete Response]");break}else if(e==gc$1){a.o=4;J$1(15);F$1(a.j,a.m,c,"[Invalid Chunk]");d=!1;break}else F$1(a.j,a.m,e,null),sc$1(a,e);qc(a)&&e!=hc$1&&e!=gc$1&&(a.h.g="",a.C=0);4!=b||0!=c.length||a.h.h||(a.o=1,J$1(16),d=!1);a.i=a.i&&d;d?0<c.length&&!a.aa&&(a.aa=!0,b=a.l,b.g==a&&b.$&&!b.L&&(b.h.info("Great, no buffering proxy detected. Bytes received: "+c.length),wc$1(b),b.L=!0,J$1(11))):(F$1(a.j,a.m,
+    c,"[Invalid Chunked Response]"),P(a),rc$1(a));}k.fb=function(){if(this.g){var a=O$1(this.g),b=this.g.ga();this.C<b.length&&(pc$1(this),tc$1(this,a,b),this.i&&4!=a&&lc(this));}};function vc(a,b){var c=a.C,d=b.indexOf("\n",c);if(-1==d)return hc$1;c=Number(b.substring(c,d));if(isNaN(c))return gc$1;d+=1;if(d+c>b.length)return hc$1;b=b.substr(d,c);a.C=d+c;return b}k.cancel=function(){this.I=!0;P(this);};function lc(a){a.Y=Date.now()+a.P;xc(a,a.P);}
+    function xc(a,b){if(null!=a.B)throw Error("WatchDog timer not null");a.B=K$1(q$1(a.eb,a),b);}function pc$1(a){a.B&&(l.clearTimeout(a.B),a.B=null);}k.eb=function(){this.B=null;const a=Date.now();0<=a-this.Y?(Qb(this.j,this.A),2!=this.K&&(I(3),J$1(17)),P(this),this.o=2,rc$1(this)):xc(this,this.Y-a);};function rc$1(a){0==a.l.G||a.I||uc$1(a.l,a);}function P(a){pc$1(a);var b=a.L;b&&"function"==typeof b.na&&b.na();a.L=null;Fb(a.W);Lb(a.V);a.g&&(b=a.g,a.g=null,b.abort(),b.na());}
+    function sc$1(a,b){try{var c=a.l;if(0!=c.G&&(c.g==a||yc$1(c.i,a)))if(c.I=a.N,!a.J&&yc$1(c.i,a)&&3==c.G){try{var d=c.Ca.g.parse(b);}catch(m){d=null;}if(Array.isArray(d)&&3==d.length){var e=d;if(0==e[0])a:{if(!c.u){if(c.g)if(c.g.F+3E3<a.F)zc(c),Ac(c);else break a;Bc(c);J$1(18);}}else c.ta=e[1],0<c.ta-c.U&&37500>e[2]&&c.N&&0==c.A&&!c.v&&(c.v=K$1(q$1(c.ab,c),6E3));if(1>=Cc$1(c.i)&&c.ka){try{c.ka();}catch(m){}c.ka=void 0;}}else Q$1(c,11);}else if((a.J||c.g==a)&&zc(c),!sa(b))for(e=c.Ca.g.parse(b),b=0;b<e.length;b++){let m=e[b];
+    c.U=m[0];m=m[1];if(2==c.G)if("c"==m[0]){c.J=m[1];c.la=m[2];const r=m[3];null!=r&&(c.ma=r,c.h.info("VER="+c.ma));const G=m[4];null!=G&&(c.za=G,c.h.info("SVER="+c.za));const Da=m[5];null!=Da&&"number"===typeof Da&&0<Da&&(d=1.5*Da,c.K=d,c.h.info("backChannelRequestTimeoutMs_="+d));d=c;const ca=a.g;if(ca){const Ea=ca.g?ca.g.getResponseHeader("X-Client-Wire-Protocol"):null;if(Ea){var f=d.i;!f.g&&(w(Ea,"spdy")||w(Ea,"quic")||w(Ea,"h2"))&&(f.j=f.l,f.g=new Set,f.h&&(Dc(f,f.h),f.h=null));}if(d.D){const xb=
+    ca.g?ca.g.getResponseHeader("X-HTTP-Session-Id"):null;xb&&(d.sa=xb,R(d.F,d.D,xb));}}c.G=3;c.j&&c.j.xa();c.$&&(c.O=Date.now()-a.F,c.h.info("Handshake RTT: "+c.O+"ms"));d=c;var h=a;d.oa=Ec$1(d,d.H?d.la:null,d.W);if(h.J){Fc$1(d.i,h);var n=h,u=d.K;u&&n.setTimeout(u);n.B&&(pc$1(n),lc(n));d.g=h;}else Gc$1(d);0<c.l.length&&Hc(c);}else "stop"!=m[0]&&"close"!=m[0]||Q$1(c,7);else 3==c.G&&("stop"==m[0]||"close"==m[0]?"stop"==m[0]?Q$1(c,7):Ic(c):"noop"!=m[0]&&c.j&&c.j.wa(m),c.A=0);}I(4);}catch(m){}}function Jc(a){if(a.R&&"function"==typeof a.R)return a.R();if("string"===typeof a)return a.split("");if(ba$1(a)){for(var b=[],c=a.length,d=0;d<c;d++)b.push(a[d]);return b}b=[];c=0;for(d in a)b[c++]=a[d];return b}
+    function Kc$1(a,b){if(a.forEach&&"function"==typeof a.forEach)a.forEach(b,void 0);else if(ba$1(a)||"string"===typeof a)na(a,b,void 0);else {if(a.T&&"function"==typeof a.T)var c=a.T();else if(a.R&&"function"==typeof a.R)c=void 0;else if(ba$1(a)||"string"===typeof a){c=[];for(var d=a.length,e=0;e<d;e++)c.push(e);}else for(e in c=[],d=0,a)c[d++]=e;d=Jc(a);e=d.length;for(var f=0;f<e;f++)b.call(void 0,d[f],c&&c[f],a);}}function S$1(a,b){this.h={};this.g=[];this.i=0;var c=arguments.length;if(1<c){if(c%2)throw Error("Uneven number of arguments");for(var d=0;d<c;d+=2)this.set(arguments[d],arguments[d+1]);}else if(a)if(a instanceof S$1)for(c=a.T(),d=0;d<c.length;d++)this.set(c[d],a.get(c[d]));else for(d in a)this.set(d,a[d]);}k=S$1.prototype;k.R=function(){Lc$1(this);for(var a=[],b=0;b<this.g.length;b++)a.push(this.h[this.g[b]]);return a};k.T=function(){Lc$1(this);return this.g.concat()};
+    function Lc$1(a){if(a.i!=a.g.length){for(var b=0,c=0;b<a.g.length;){var d=a.g[b];T(a.h,d)&&(a.g[c++]=d);b++;}a.g.length=c;}if(a.i!=a.g.length){var e={};for(c=b=0;b<a.g.length;)d=a.g[b],T(e,d)||(a.g[c++]=d,e[d]=1),b++;a.g.length=c;}}k.get=function(a,b){return T(this.h,a)?this.h[a]:b};k.set=function(a,b){T(this.h,a)||(this.i++,this.g.push(a));this.h[a]=b;};k.forEach=function(a,b){for(var c=this.T(),d=0;d<c.length;d++){var e=c[d],f=this.get(e);a.call(b,f,e,this);}};
+    function T(a,b){return Object.prototype.hasOwnProperty.call(a,b)}var Mc=/^(?:([^:/?#.]+):)?(?:\/\/(?:([^\\/?#]*)@)?([^\\/?#]*?)(?::([0-9]+))?(?=[\\/?#]|$))?([^?#]+)?(?:\?([^#]*))?(?:#([\s\S]*))?$/;function Nc$1(a,b){if(a){a=a.split("&");for(var c=0;c<a.length;c++){var d=a[c].indexOf("="),e=null;if(0<=d){var f=a[c].substring(0,d);e=a[c].substring(d+1);}else f=a[c];b(f,e?decodeURIComponent(e.replace(/\+/g," ")):"");}}}function U(a,b){this.i=this.s=this.j="";this.m=null;this.o=this.l="";this.g=!1;if(a instanceof U){this.g=void 0!==b?b:a.g;Oc(this,a.j);this.s=a.s;Pc(this,a.i);Qc$1(this,a.m);this.l=a.l;b=a.h;var c=new Rc;c.i=b.i;b.g&&(c.g=new S$1(b.g),c.h=b.h);Sc(this,c);this.o=a.o;}else a&&(c=String(a).match(Mc))?(this.g=!!b,Oc(this,c[1]||"",!0),this.s=Tc$1(c[2]||""),Pc(this,c[3]||"",!0),Qc$1(this,c[4]),this.l=Tc$1(c[5]||"",!0),Sc(this,c[6]||"",!0),this.o=Tc$1(c[7]||"")):(this.g=!!b,this.h=new Rc(null,this.g));}
+    U.prototype.toString=function(){var a=[],b=this.j;b&&a.push(Uc(b,Vc,!0),":");var c=this.i;if(c||"file"==b)a.push("//"),(b=this.s)&&a.push(Uc(b,Vc,!0),"@"),a.push(encodeURIComponent(String(c)).replace(/%25([0-9a-fA-F]{2})/g,"%$1")),c=this.m,null!=c&&a.push(":",String(c));if(c=this.l)this.i&&"/"!=c.charAt(0)&&a.push("/"),a.push(Uc(c,"/"==c.charAt(0)?Wc$1:Xc$1,!0));(c=this.h.toString())&&a.push("?",c);(c=this.o)&&a.push("#",Uc(c,Yc$1));return a.join("")};function N$1(a){return new U(a)}
+    function Oc(a,b,c){a.j=c?Tc$1(b,!0):b;a.j&&(a.j=a.j.replace(/:$/,""));}function Pc(a,b,c){a.i=c?Tc$1(b,!0):b;}function Qc$1(a,b){if(b){b=Number(b);if(isNaN(b)||0>b)throw Error("Bad port number "+b);a.m=b;}else a.m=null;}function Sc(a,b,c){b instanceof Rc?(a.h=b,Zc(a.h,a.g)):(c||(b=Uc(b,$c)),a.h=new Rc(b,a.g));}function R(a,b,c){a.h.set(b,c);}function jc$1(a){R(a,"zx",Math.floor(2147483648*Math.random()).toString(36)+Math.abs(Math.floor(2147483648*Math.random())^Date.now()).toString(36));return a}
+    function ad(a){return a instanceof U?N$1(a):new U(a,void 0)}function bd(a,b,c,d){var e=new U(null,void 0);a&&Oc(e,a);b&&Pc(e,b);c&&Qc$1(e,c);d&&(e.l=d);return e}function Tc$1(a,b){return a?b?decodeURI(a.replace(/%25/g,"%2525")):decodeURIComponent(a):""}function Uc(a,b,c){return "string"===typeof a?(a=encodeURI(a).replace(b,cd),c&&(a=a.replace(/%25([0-9a-fA-F]{2})/g,"%$1")),a):null}function cd(a){a=a.charCodeAt(0);return "%"+(a>>4&15).toString(16)+(a&15).toString(16)}
+    var Vc=/[#\/\?@]/g,Xc$1=/[#\?:]/g,Wc$1=/[#\?]/g,$c=/[#\?@]/g,Yc$1=/#/g;function Rc(a,b){this.h=this.g=null;this.i=a||null;this.j=!!b;}function V(a){a.g||(a.g=new S$1,a.h=0,a.i&&Nc$1(a.i,function(b,c){a.add(decodeURIComponent(b.replace(/\+/g," ")),c);}));}k=Rc.prototype;k.add=function(a,b){V(this);this.i=null;a=W$1(this,a);var c=this.g.get(a);c||this.g.set(a,c=[]);c.push(b);this.h+=1;return this};
+    function dd(a,b){V(a);b=W$1(a,b);T(a.g.h,b)&&(a.i=null,a.h-=a.g.get(b).length,a=a.g,T(a.h,b)&&(delete a.h[b],a.i--,a.g.length>2*a.i&&Lc$1(a)));}function ed(a,b){V(a);b=W$1(a,b);return T(a.g.h,b)}k.forEach=function(a,b){V(this);this.g.forEach(function(c,d){na(c,function(e){a.call(b,e,d,this);},this);},this);};k.T=function(){V(this);for(var a=this.g.R(),b=this.g.T(),c=[],d=0;d<b.length;d++)for(var e=a[d],f=0;f<e.length;f++)c.push(b[d]);return c};
+    k.R=function(a){V(this);var b=[];if("string"===typeof a)ed(this,a)&&(b=qa(b,this.g.get(W$1(this,a))));else {a=this.g.R();for(var c=0;c<a.length;c++)b=qa(b,a[c]);}return b};k.set=function(a,b){V(this);this.i=null;a=W$1(this,a);ed(this,a)&&(this.h-=this.g.get(a).length);this.g.set(a,[b]);this.h+=1;return this};k.get=function(a,b){if(!a)return b;a=this.R(a);return 0<a.length?String(a[0]):b};function mc$1(a,b,c){dd(a,b);0<c.length&&(a.i=null,a.g.set(W$1(a,b),ra(c)),a.h+=c.length);}
+    k.toString=function(){if(this.i)return this.i;if(!this.g)return "";for(var a=[],b=this.g.T(),c=0;c<b.length;c++){var d=b[c],e=encodeURIComponent(String(d));d=this.R(d);for(var f=0;f<d.length;f++){var h=e;""!==d[f]&&(h+="="+encodeURIComponent(String(d[f])));a.push(h);}}return this.i=a.join("&")};function W$1(a,b){b=String(b);a.j&&(b=b.toLowerCase());return b}function Zc(a,b){b&&!a.j&&(V(a),a.i=null,a.g.forEach(function(c,d){var e=d.toLowerCase();d!=e&&(dd(this,d),mc$1(this,e,c));},a));a.j=b;}var fd=class{constructor(a,b){this.h=a;this.g=b;}};function gd(a){this.l=a||hd;l.PerformanceNavigationTiming?(a=l.performance.getEntriesByType("navigation"),a=0<a.length&&("hq"==a[0].nextHopProtocol||"h2"==a[0].nextHopProtocol)):a=!!(l.g&&l.g.Ea&&l.g.Ea()&&l.g.Ea().Zb);this.j=a?this.l:1;this.g=null;1<this.j&&(this.g=new Set);this.h=null;this.i=[];}var hd=10;function id(a){return a.h?!0:a.g?a.g.size>=a.j:!1}function Cc$1(a){return a.h?1:a.g?a.g.size:0}function yc$1(a,b){return a.h?a.h==b:a.g?a.g.has(b):!1}function Dc(a,b){a.g?a.g.add(b):a.h=b;}
+    function Fc$1(a,b){a.h&&a.h==b?a.h=null:a.g&&a.g.has(b)&&a.g.delete(b);}gd.prototype.cancel=function(){this.i=jd(this);if(this.h)this.h.cancel(),this.h=null;else if(this.g&&0!==this.g.size){for(const a of this.g.values())a.cancel();this.g.clear();}};function jd(a){if(null!=a.h)return a.i.concat(a.h.D);if(null!=a.g&&0!==a.g.size){let b=a.i;for(const c of a.g.values())b=b.concat(c.D);return b}return ra(a.i)}function kd(){}kd.prototype.stringify=function(a){return l.JSON.stringify(a,void 0)};kd.prototype.parse=function(a){return l.JSON.parse(a,void 0)};function ld(){this.g=new kd;}function md(a,b,c){const d=c||"";try{Kc$1(a,function(e,f){let h=e;p(e)&&(h=rb(e));b.push(d+f+"="+encodeURIComponent(h));});}catch(e){throw b.push(d+"type="+encodeURIComponent("_badmap")),e;}}function nd(a,b){const c=new Mb;if(l.Image){const d=new Image;d.onload=ja(od,c,d,"TestLoadImage: loaded",!0,b);d.onerror=ja(od,c,d,"TestLoadImage: error",!1,b);d.onabort=ja(od,c,d,"TestLoadImage: abort",!1,b);d.ontimeout=ja(od,c,d,"TestLoadImage: timeout",!1,b);l.setTimeout(function(){if(d.ontimeout)d.ontimeout();},1E4);d.src=a;}else b(!1);}function od(a,b,c,d,e){try{b.onload=null,b.onerror=null,b.onabort=null,b.ontimeout=null,e(d);}catch(f){}}function pd(a){this.l=a.$b||null;this.j=a.ib||!1;}t(pd,Yb);pd.prototype.g=function(){return new qd(this.l,this.j)};pd.prototype.i=function(a){return function(){return a}}({});function qd(a,b){C$1.call(this);this.D=a;this.u=b;this.m=void 0;this.readyState=rd;this.status=0;this.responseType=this.responseText=this.response=this.statusText="";this.onreadystatechange=null;this.v=new Headers;this.h=null;this.C="GET";this.B="";this.g=!1;this.A=this.j=this.l=null;}t(qd,C$1);var rd=0;k=qd.prototype;
     k.open=function(a,b){if(this.readyState!=rd)throw this.abort(),Error("Error reopening a connection");this.C=a;this.B=b;this.readyState=1;sd(this);};k.send=function(a){if(1!=this.readyState)throw this.abort(),Error("need to call open() first. ");this.g=!0;const b={headers:this.v,method:this.C,credentials:this.m,cache:void 0};a&&(b.body=a);(this.D||l).fetch(new Request(this.B,b)).then(this.Va.bind(this),this.ha.bind(this));};
     k.abort=function(){this.response=this.responseText="";this.v=new Headers;this.status=0;this.j&&this.j.cancel("Request was aborted.");1<=this.readyState&&this.g&&4!=this.readyState&&(this.g=!1,td(this));this.readyState=rd;};
     k.Va=function(a){if(this.g&&(this.l=a,this.h||(this.status=this.l.status,this.statusText=this.l.statusText,this.h=a.headers,this.readyState=2,sd(this)),this.g&&(this.readyState=3,sd(this),this.g)))if("arraybuffer"===this.responseType)a.arrayBuffer().then(this.Ta.bind(this),this.ha.bind(this));else if("undefined"!==typeof l.ReadableStream&&"body"in a){this.j=a.body.getReader();if(this.u){if(this.responseType)throw Error('responseType must be empty for "streamBinaryChunks" mode responses.');this.response=
     [];}else this.response=this.responseText="",this.A=new TextDecoder;ud(this);}else a.text().then(this.Ua.bind(this),this.ha.bind(this));};function ud(a){a.j.read().then(a.Sa.bind(a)).catch(a.ha.bind(a));}k.Sa=function(a){if(this.g){if(this.u&&a.value)this.response.push(a.value);else if(!this.u){var b=a.value?a.value:new Uint8Array(0);if(b=this.A.decode(b,{stream:!a.done}))this.response=this.responseText+=b;}a.done?td(this):sd(this);3==this.readyState&&ud(this);}};
     k.Ua=function(a){this.g&&(this.response=this.responseText=a,td(this));};k.Ta=function(a){this.g&&(this.response=a,td(this));};k.ha=function(){this.g&&td(this);};function td(a){a.readyState=4;a.l=null;a.j=null;a.A=null;sd(a);}k.setRequestHeader=function(a,b){this.v.append(a,b);};k.getResponseHeader=function(a){return this.h?this.h.get(a.toLowerCase())||"":""};
     k.getAllResponseHeaders=function(){if(!this.h)return "";const a=[],b=this.h.entries();for(var c=b.next();!c.done;)c=c.value,a.push(c[0]+": "+c[1]),c=b.next();return a.join("\r\n")};function sd(a){a.onreadystatechange&&a.onreadystatechange.call(a);}Object.defineProperty(qd.prototype,"withCredentials",{get:function(){return "include"===this.m},set:function(a){this.m=a?"include":"same-origin";}});var vd=l.JSON.parse;function X$1(a){C$1.call(this);this.headers=new S$1;this.u=a||null;this.h=!1;this.C=this.g=null;this.H="";this.m=0;this.j="";this.l=this.F=this.v=this.D=!1;this.B=0;this.A=null;this.J=wd;this.K=this.L=!1;}t(X$1,C$1);var wd="",xd=/^https?$/i,yd=["POST","PUT"];k=X$1.prototype;
-    k.ea=function(a,b,c,d){if(this.g)throw Error("[goog.net.XhrIo] Object is active with another request="+this.H+"; newUri="+a);b=b?b.toUpperCase():"GET";this.H=a;this.j="";this.m=0;this.D=!1;this.h=!0;this.g=this.u?this.u.g():cc.g();this.C=this.u?Zb(this.u):Zb(cc);this.g.onreadystatechange=q$1(this.Fa,this);try{this.F=!0,this.g.open(b,String(a),!0),this.F=!1;}catch(f){zd(this,f);return}a=c||"";const e=new S$1(this.headers);d&&Kc(d,function(f,h){e.set(h,f);});d=oa$1(e.T());c=l.FormData&&a instanceof l.FormData;
+    k.ea=function(a,b,c,d){if(this.g)throw Error("[goog.net.XhrIo] Object is active with another request="+this.H+"; newUri="+a);b=b?b.toUpperCase():"GET";this.H=a;this.j="";this.m=0;this.D=!1;this.h=!0;this.g=this.u?this.u.g():cc$1.g();this.C=this.u?Zb(this.u):Zb(cc$1);this.g.onreadystatechange=q$1(this.Fa,this);try{this.F=!0,this.g.open(b,String(a),!0),this.F=!1;}catch(f){zd(this,f);return}a=c||"";const e=new S$1(this.headers);d&&Kc$1(d,function(f,h){e.set(h,f);});d=oa(e.T());c=l.FormData&&a instanceof l.FormData;
     !(0<=ma$1(yd,b))||d||c||e.set("Content-Type","application/x-www-form-urlencoded;charset=utf-8");e.forEach(function(f,h){this.g.setRequestHeader(h,f);},this);this.J&&(this.g.responseType=this.J);"withCredentials"in this.g&&this.g.withCredentials!==this.L&&(this.g.withCredentials=this.L);try{Ad(this),0<this.B&&((this.K=Bd(this.g))?(this.g.timeout=this.B,this.g.ontimeout=q$1(this.pa,this)):this.A=Gb(this.pa,this.B,this)),this.v=!0,this.g.send(a),this.v=!1;}catch(f){zd(this,f);}};
-    function Bd(a){return y&&Ra()&&"number"===typeof a.timeout&&void 0!==a.ontimeout}function pa$1(a){return "content-type"==a.toLowerCase()}k.pa=function(){"undefined"!=typeof goog&&this.g&&(this.j="Timed out after "+this.B+"ms, aborting",this.m=8,D$1(this,"timeout"),this.abort(8));};function zd(a,b){a.h=!1;a.g&&(a.l=!0,a.g.abort(),a.l=!1);a.j=b;a.m=5;Cd(a);Dd(a);}function Cd(a){a.D||(a.D=!0,D$1(a,"complete"),D$1(a,"error"));}
+    function Bd(a){return y&&Ra$1()&&"number"===typeof a.timeout&&void 0!==a.ontimeout}function pa$1(a){return "content-type"==a.toLowerCase()}k.pa=function(){"undefined"!=typeof goog&&this.g&&(this.j="Timed out after "+this.B+"ms, aborting",this.m=8,D$1(this,"timeout"),this.abort(8));};function zd(a,b){a.h=!1;a.g&&(a.l=!0,a.g.abort(),a.l=!1);a.j=b;a.m=5;Cd(a);Dd(a);}function Cd(a){a.D||(a.D=!0,D$1(a,"complete"),D$1(a,"error"));}
     k.abort=function(a){this.g&&this.h&&(this.h=!1,this.l=!0,this.g.abort(),this.l=!1,this.m=a||7,D$1(this,"complete"),D$1(this,"abort"),Dd(this));};k.M=function(){this.g&&(this.h&&(this.h=!1,this.l=!0,this.g.abort(),this.l=!1),Dd(this,!0));X$1.Z.M.call(this);};k.Fa=function(){this.s||(this.F||this.v||this.l?Ed(this):this.cb());};k.cb=function(){Ed(this);};
-    function Ed(a){if(a.h&&"undefined"!=typeof goog&&(!a.C[1]||4!=O$1(a)||2!=a.ba()))if(a.v&&4==O$1(a))Gb(a.Fa,0,a);else if(D$1(a,"readystatechange"),4==O$1(a)){a.h=!1;try{const n=a.ba();a:switch(n){case 200:case 201:case 202:case 204:case 206:case 304:case 1223:var b=!0;break a;default:b=!1;}var c;if(!(c=b)){var d;if(d=0===n){var e=String(a.H).match(Mc$1)[1]||null;if(!e&&l.self&&l.self.location){var f=l.self.location.protocol;e=f.substr(0,f.length-1);}d=!xd.test(e?e.toLowerCase():"");}c=d;}if(c)D$1(a,"complete"),D$1(a,
-    "success");else {a.m=6;try{var h=2<O$1(a)?a.g.statusText:"";}catch(u){h="";}a.j=h+" ["+a.ba()+"]";Cd(a);}}finally{Dd(a);}}}function Dd(a,b){if(a.g){Ad(a);const c=a.g,d=a.C[0]?aa$1:null;a.g=null;a.C=null;b||D$1(a,"ready");try{c.onreadystatechange=d;}catch(e){}}}function Ad(a){a.g&&a.K&&(a.g.ontimeout=null);a.A&&(l.clearTimeout(a.A),a.A=null);}function O$1(a){return a.g?a.g.readyState:0}k.ba=function(){try{return 2<O$1(this)?this.g.status:-1}catch(a){return -1}};
-    k.ga=function(){try{return this.g?this.g.responseText:""}catch(a){return ""}};k.Qa=function(a){if(this.g){var b=this.g.responseText;a&&0==b.indexOf(a)&&(b=b.substring(a.length));return vd(b)}};function oc(a){try{if(!a.g)return null;if("response"in a.g)return a.g.response;switch(a.J){case wd:case "text":return a.g.responseText;case "arraybuffer":if("mozResponseArrayBuffer"in a.g)return a.g.mozResponseArrayBuffer}return null}catch(b){return null}}k.Da=function(){return this.m};
+    function Ed(a){if(a.h&&"undefined"!=typeof goog&&(!a.C[1]||4!=O$1(a)||2!=a.ba()))if(a.v&&4==O$1(a))Gb(a.Fa,0,a);else if(D$1(a,"readystatechange"),4==O$1(a)){a.h=!1;try{const n=a.ba();a:switch(n){case 200:case 201:case 202:case 204:case 206:case 304:case 1223:var b=!0;break a;default:b=!1;}var c;if(!(c=b)){var d;if(d=0===n){var e=String(a.H).match(Mc)[1]||null;if(!e&&l.self&&l.self.location){var f=l.self.location.protocol;e=f.substr(0,f.length-1);}d=!xd.test(e?e.toLowerCase():"");}c=d;}if(c)D$1(a,"complete"),D$1(a,
+    "success");else {a.m=6;try{var h=2<O$1(a)?a.g.statusText:"";}catch(u){h="";}a.j=h+" ["+a.ba()+"]";Cd(a);}}finally{Dd(a);}}}function Dd(a,b){if(a.g){Ad(a);const c=a.g,d=a.C[0]?aa:null;a.g=null;a.C=null;b||D$1(a,"ready");try{c.onreadystatechange=d;}catch(e){}}}function Ad(a){a.g&&a.K&&(a.g.ontimeout=null);a.A&&(l.clearTimeout(a.A),a.A=null);}function O$1(a){return a.g?a.g.readyState:0}k.ba=function(){try{return 2<O$1(this)?this.g.status:-1}catch(a){return -1}};
+    k.ga=function(){try{return this.g?this.g.responseText:""}catch(a){return ""}};k.Qa=function(a){if(this.g){var b=this.g.responseText;a&&0==b.indexOf(a)&&(b=b.substring(a.length));return vd(b)}};function oc$1(a){try{if(!a.g)return null;if("response"in a.g)return a.g.response;switch(a.J){case wd:case "text":return a.g.responseText;case "arraybuffer":if("mozResponseArrayBuffer"in a.g)return a.g.mozResponseArrayBuffer}return null}catch(b){return null}}k.Da=function(){return this.m};
     k.La=function(){return "string"===typeof this.j?this.j:String(this.j)};function Fd(a){let b="";xa(a,function(c,d){b+=d;b+=":";b+=c;b+="\r\n";});return b}function Gd(a,b,c){a:{for(d in c){var d=!1;break a}d=!0;}d||(c=Fd(c),"string"===typeof a?(null!=c&&encodeURIComponent(String(c))):R(a,b,c));}function Hd(a,b,c){return c&&c.internalChannelParams?c.internalChannelParams[a]||b:b}
     function Id(a){this.za=0;this.l=[];this.h=new Mb;this.la=this.oa=this.F=this.W=this.g=this.sa=this.D=this.aa=this.o=this.P=this.s=null;this.Za=this.V=0;this.Xa=Hd("failFast",!1,a);this.N=this.v=this.u=this.m=this.j=null;this.X=!0;this.I=this.ta=this.U=-1;this.Y=this.A=this.C=0;this.Pa=Hd("baseRetryDelayMs",5E3,a);this.$a=Hd("retryDelaySeedMs",1E4,a);this.Ya=Hd("forwardChannelMaxRetries",2,a);this.ra=Hd("forwardChannelRequestTimeoutMs",2E4,a);this.qa=a&&a.xmlHttpFactory||void 0;this.Ba=a&&a.Yb||!1;
     this.K=void 0;this.H=a&&a.supportsCrossDomainXhr||!1;this.J="";this.i=new gd(a&&a.concurrentRequestLimit);this.Ca=new ld;this.ja=a&&a.fastHandshake||!1;this.Ra=a&&a.Wb||!1;a&&a.Aa&&this.h.Aa();a&&a.forceLongPolling&&(this.X=!1);this.$=!this.ja&&this.X&&a&&a.detectBufferingProxy||!1;this.ka=void 0;this.O=0;this.L=!1;this.B=null;this.Wa=!a||!1!==a.Xb;}k=Id.prototype;k.ma=8;k.G=1;
-    function Ic$1(a){Jd(a);if(3==a.G){var b=a.V++,c=N$1(a.F);R(c,"SID",a.J);R(c,"RID",b);R(c,"TYPE","terminate");Kd(a,c);b=new M$1(a,a.h,b,void 0);b.K=2;b.v=jc(N$1(c));c=!1;l.navigator&&l.navigator.sendBeacon&&(c=l.navigator.sendBeacon(b.v.toString(),""));!c&&l.Image&&((new Image).src=b.v,c=!0);c||(b.g=nc(b.l,null),b.g.ea(b.v));b.F=Date.now();lc$1(b);}Ld(a);}k.hb=function(a){try{this.h.info("Origin Trials invoked: "+a);}catch(b){}};function Ac$1(a){a.g&&(wc$1(a),a.g.cancel(),a.g=null);}
-    function Jd(a){Ac$1(a);a.u&&(l.clearTimeout(a.u),a.u=null);zc(a);a.i.cancel();a.m&&("number"===typeof a.m&&l.clearTimeout(a.m),a.m=null);}function Md(a,b){a.l.push(new fd(a.Za++,b));3==a.G&&Hc(a);}function Hc(a){id(a.i)||a.m||(a.m=!0,zb(a.Ha,a),a.C=0);}function Nd(a,b){if(Cc(a.i)>=a.i.j-(a.m?1:0))return !1;if(a.m)return a.l=b.D.concat(a.l),!0;if(1==a.G||2==a.G||a.C>=(a.Xa?0:a.Ya))return !1;a.m=K$1(q$1(a.Ha,a,b),Od(a,a.C));a.C++;return !0}
-    k.Ha=function(a){if(this.m)if(this.m=null,1==this.G){if(!a){this.V=Math.floor(1E5*Math.random());a=this.V++;const e=new M$1(this,this.h,a,void 0);let f=this.s;this.P&&(f?(f=ya$1(f),Aa(f,this.P)):f=this.P);null===this.o&&(e.H=f);if(this.ja)a:{var b=0;for(var c=0;c<this.l.length;c++){b:{var d=this.l[c];if("__data__"in d.g&&(d=d.g.__data__,"string"===typeof d)){d=d.length;break b}d=void 0;}if(void 0===d)break;b+=d;if(4096<b){b=c;break a}if(4096===b||c===this.l.length-1){b=c+1;break a}}b=1E3;}else b=1E3;b=
-    Pd(this,e,b);c=N$1(this.F);R(c,"RID",a);R(c,"CVER",22);this.D&&R(c,"X-HTTP-Session-Id",this.D);Kd(this,c);this.o&&f&&Gd(c,this.o,f);Dc$1(this.i,e);this.Ra&&R(c,"TYPE","init");this.ja?(R(c,"$req",b),R(c,"SID","null"),e.$=!0,ic$1(e,c,null)):ic$1(e,c,b);this.G=2;}}else 3==this.G&&(a?Qd(this,a):0==this.l.length||id(this.i)||Qd(this));};
-    function Qd(a,b){var c;b?c=b.m:c=a.V++;const d=N$1(a.F);R(d,"SID",a.J);R(d,"RID",c);R(d,"AID",a.U);Kd(a,d);a.o&&a.s&&Gd(d,a.o,a.s);c=new M$1(a,a.h,c,a.C+1);null===a.o&&(c.H=a.s);b&&(a.l=b.D.concat(a.l));b=Pd(a,c,1E3);c.setTimeout(Math.round(.5*a.ra)+Math.round(.5*a.ra*Math.random()));Dc$1(a.i,c);ic$1(c,d,b);}function Kd(a,b){a.j&&Kc({},function(c,d){R(b,d,c);});}
-    function Pd(a,b,c){c=Math.min(a.l.length,c);var d=a.j?q$1(a.j.Oa,a.j,a):null;a:{var e=a.l;let f=-1;for(;;){const h=["count="+c];-1==f?0<c?(f=e[0].h,h.push("ofs="+f)):f=0:h.push("ofs="+f);let n=!0;for(let u=0;u<c;u++){let m=e[u].h;const r=e[u].g;m-=f;if(0>m)f=Math.max(0,e[u].h-100),n=!1;else try{md(r,h,"req"+m+"_");}catch(G){d&&d(r);}}if(n){d=h.join("&");break a}}}a=a.l.splice(0,c);b.D=a;return d}function Gc(a){a.g||a.u||(a.Y=1,zb(a.Ga,a),a.A=0);}
-    function Bc(a){if(a.g||a.u||3<=a.A)return !1;a.Y++;a.u=K$1(q$1(a.Ga,a),Od(a,a.A));a.A++;return !0}k.Ga=function(){this.u=null;Rd(this);if(this.$&&!(this.L||null==this.g||0>=this.O)){var a=2*this.O;this.h.info("BP detection timer enabled: "+a);this.B=K$1(q$1(this.bb,this),a);}};k.bb=function(){this.B&&(this.B=null,this.h.info("BP detection timeout reached."),this.h.info("Buffering proxy detected and switch to long-polling!"),this.N=!1,this.L=!0,J$1(10),Ac$1(this),Rd(this));};
-    function wc$1(a){null!=a.B&&(l.clearTimeout(a.B),a.B=null);}function Rd(a){a.g=new M$1(a,a.h,"rpc",a.Y);null===a.o&&(a.g.H=a.s);a.g.O=0;var b=N$1(a.oa);R(b,"RID","rpc");R(b,"SID",a.J);R(b,"CI",a.N?"0":"1");R(b,"AID",a.U);Kd(a,b);R(b,"TYPE","xmlhttp");a.o&&a.s&&Gd(b,a.o,a.s);a.K&&a.g.setTimeout(a.K);var c=a.g;a=a.la;c.K=1;c.v=jc(N$1(b));c.s=null;c.U=!0;kc$1(c,a);}k.ab=function(){null!=this.v&&(this.v=null,Ac$1(this),Bc(this),J$1(19));};function zc(a){null!=a.v&&(l.clearTimeout(a.v),a.v=null);}
-    function uc$1(a,b){var c=null;if(a.g==b){zc(a);wc$1(a);a.g=null;var d=2;}else if(yc(a.i,b))c=b.D,Fc$1(a.i,b),d=1;else return;a.I=b.N;if(0!=a.G)if(b.i)if(1==d){c=b.s?b.s.length:0;b=Date.now()-b.F;var e=a.C;d=Sb();D$1(d,new Vb(d,c,b,e));Hc(a);}else Gc(a);else if(e=b.o,3==e||0==e&&0<a.I||!(1==d&&Nd(a,b)||2==d&&Bc(a)))switch(c&&0<c.length&&(b=a.i,b.i=b.i.concat(c)),e){case 1:Q$1(a,5);break;case 4:Q$1(a,10);break;case 3:Q$1(a,6);break;default:Q$1(a,2);}}
-    function Od(a,b){let c=a.Pa+Math.floor(Math.random()*a.$a);a.j||(c*=2);return c*b}function Q$1(a,b){a.h.info("Error code "+b);if(2==b){var c=null;a.j&&(c=null);var d=q$1(a.jb,a);c||(c=new U("//www.google.com/images/cleardot.gif"),l.location&&"http"==l.location.protocol||Oc(c,"https"),jc(c));nd(c.toString(),d);}else J$1(2);a.G=0;a.j&&a.j.va(b);Ld(a);Jd(a);}k.jb=function(a){a?(this.h.info("Successfully pinged google.com"),J$1(2)):(this.h.info("Failed to ping google.com"),J$1(1));};
-    function Ld(a){a.G=0;a.I=-1;if(a.j){if(0!=jd(a.i).length||0!=a.l.length)a.i.i.length=0,ra$1(a.l),a.l.length=0;a.j.ua();}}function Ec(a,b,c){let d=ad(c);if(""!=d.i)b&&Pc(d,b+"."+d.i),Qc(d,d.m);else {const e=l.location;d=bd(e.protocol,b?b+"."+e.hostname:e.hostname,+e.port,c);}a.aa&&xa(a.aa,function(e,f){R(d,f,e);});b=a.D;c=a.sa;b&&c&&R(d,b,c);R(d,"VER",a.ma);Kd(a,d);return d}
-    function nc(a,b,c){if(b&&!a.H)throw Error("Can't create secondary domain capable XhrIo object.");b=c&&a.Ba&&!a.qa?new X$1(new pd({ib:!0})):new X$1(a.qa);b.L=a.H;return b}function Sd(){}k=Sd.prototype;k.xa=function(){};k.wa=function(){};k.va=function(){};k.ua=function(){};k.Oa=function(){};function Td(){if(y&&!(10<=Number(Ua)))throw Error("Environmental error: no available transport.");}Td.prototype.g=function(a,b){return new Y$1(a,b)};
+    function Ic(a){Jd(a);if(3==a.G){var b=a.V++,c=N$1(a.F);R(c,"SID",a.J);R(c,"RID",b);R(c,"TYPE","terminate");Kd(a,c);b=new M$1(a,a.h,b,void 0);b.K=2;b.v=jc$1(N$1(c));c=!1;l.navigator&&l.navigator.sendBeacon&&(c=l.navigator.sendBeacon(b.v.toString(),""));!c&&l.Image&&((new Image).src=b.v,c=!0);c||(b.g=nc$1(b.l,null),b.g.ea(b.v));b.F=Date.now();lc(b);}Ld(a);}k.hb=function(a){try{this.h.info("Origin Trials invoked: "+a);}catch(b){}};function Ac(a){a.g&&(wc$1(a),a.g.cancel(),a.g=null);}
+    function Jd(a){Ac(a);a.u&&(l.clearTimeout(a.u),a.u=null);zc(a);a.i.cancel();a.m&&("number"===typeof a.m&&l.clearTimeout(a.m),a.m=null);}function Md(a,b){a.l.push(new fd(a.Za++,b));3==a.G&&Hc(a);}function Hc(a){id(a.i)||a.m||(a.m=!0,zb(a.Ha,a),a.C=0);}function Nd(a,b){if(Cc$1(a.i)>=a.i.j-(a.m?1:0))return !1;if(a.m)return a.l=b.D.concat(a.l),!0;if(1==a.G||2==a.G||a.C>=(a.Xa?0:a.Ya))return !1;a.m=K$1(q$1(a.Ha,a,b),Od(a,a.C));a.C++;return !0}
+    k.Ha=function(a){if(this.m)if(this.m=null,1==this.G){if(!a){this.V=Math.floor(1E5*Math.random());a=this.V++;const e=new M$1(this,this.h,a,void 0);let f=this.s;this.P&&(f?(f=ya(f),Aa$1(f,this.P)):f=this.P);null===this.o&&(e.H=f);if(this.ja)a:{var b=0;for(var c=0;c<this.l.length;c++){b:{var d=this.l[c];if("__data__"in d.g&&(d=d.g.__data__,"string"===typeof d)){d=d.length;break b}d=void 0;}if(void 0===d)break;b+=d;if(4096<b){b=c;break a}if(4096===b||c===this.l.length-1){b=c+1;break a}}b=1E3;}else b=1E3;b=
+    Pd(this,e,b);c=N$1(this.F);R(c,"RID",a);R(c,"CVER",22);this.D&&R(c,"X-HTTP-Session-Id",this.D);Kd(this,c);this.o&&f&&Gd(c,this.o,f);Dc(this.i,e);this.Ra&&R(c,"TYPE","init");this.ja?(R(c,"$req",b),R(c,"SID","null"),e.$=!0,ic$1(e,c,null)):ic$1(e,c,b);this.G=2;}}else 3==this.G&&(a?Qd(this,a):0==this.l.length||id(this.i)||Qd(this));};
+    function Qd(a,b){var c;b?c=b.m:c=a.V++;const d=N$1(a.F);R(d,"SID",a.J);R(d,"RID",c);R(d,"AID",a.U);Kd(a,d);a.o&&a.s&&Gd(d,a.o,a.s);c=new M$1(a,a.h,c,a.C+1);null===a.o&&(c.H=a.s);b&&(a.l=b.D.concat(a.l));b=Pd(a,c,1E3);c.setTimeout(Math.round(.5*a.ra)+Math.round(.5*a.ra*Math.random()));Dc(a.i,c);ic$1(c,d,b);}function Kd(a,b){a.j&&Kc$1({},function(c,d){R(b,d,c);});}
+    function Pd(a,b,c){c=Math.min(a.l.length,c);var d=a.j?q$1(a.j.Oa,a.j,a):null;a:{var e=a.l;let f=-1;for(;;){const h=["count="+c];-1==f?0<c?(f=e[0].h,h.push("ofs="+f)):f=0:h.push("ofs="+f);let n=!0;for(let u=0;u<c;u++){let m=e[u].h;const r=e[u].g;m-=f;if(0>m)f=Math.max(0,e[u].h-100),n=!1;else try{md(r,h,"req"+m+"_");}catch(G){d&&d(r);}}if(n){d=h.join("&");break a}}}a=a.l.splice(0,c);b.D=a;return d}function Gc$1(a){a.g||a.u||(a.Y=1,zb(a.Ga,a),a.A=0);}
+    function Bc(a){if(a.g||a.u||3<=a.A)return !1;a.Y++;a.u=K$1(q$1(a.Ga,a),Od(a,a.A));a.A++;return !0}k.Ga=function(){this.u=null;Rd(this);if(this.$&&!(this.L||null==this.g||0>=this.O)){var a=2*this.O;this.h.info("BP detection timer enabled: "+a);this.B=K$1(q$1(this.bb,this),a);}};k.bb=function(){this.B&&(this.B=null,this.h.info("BP detection timeout reached."),this.h.info("Buffering proxy detected and switch to long-polling!"),this.N=!1,this.L=!0,J$1(10),Ac(this),Rd(this));};
+    function wc$1(a){null!=a.B&&(l.clearTimeout(a.B),a.B=null);}function Rd(a){a.g=new M$1(a,a.h,"rpc",a.Y);null===a.o&&(a.g.H=a.s);a.g.O=0;var b=N$1(a.oa);R(b,"RID","rpc");R(b,"SID",a.J);R(b,"CI",a.N?"0":"1");R(b,"AID",a.U);Kd(a,b);R(b,"TYPE","xmlhttp");a.o&&a.s&&Gd(b,a.o,a.s);a.K&&a.g.setTimeout(a.K);var c=a.g;a=a.la;c.K=1;c.v=jc$1(N$1(b));c.s=null;c.U=!0;kc$1(c,a);}k.ab=function(){null!=this.v&&(this.v=null,Ac(this),Bc(this),J$1(19));};function zc(a){null!=a.v&&(l.clearTimeout(a.v),a.v=null);}
+    function uc$1(a,b){var c=null;if(a.g==b){zc(a);wc$1(a);a.g=null;var d=2;}else if(yc$1(a.i,b))c=b.D,Fc$1(a.i,b),d=1;else return;a.I=b.N;if(0!=a.G)if(b.i)if(1==d){c=b.s?b.s.length:0;b=Date.now()-b.F;var e=a.C;d=Sb();D$1(d,new Vb(d,c,b,e));Hc(a);}else Gc$1(a);else if(e=b.o,3==e||0==e&&0<a.I||!(1==d&&Nd(a,b)||2==d&&Bc(a)))switch(c&&0<c.length&&(b=a.i,b.i=b.i.concat(c)),e){case 1:Q$1(a,5);break;case 4:Q$1(a,10);break;case 3:Q$1(a,6);break;default:Q$1(a,2);}}
+    function Od(a,b){let c=a.Pa+Math.floor(Math.random()*a.$a);a.j||(c*=2);return c*b}function Q$1(a,b){a.h.info("Error code "+b);if(2==b){var c=null;a.j&&(c=null);var d=q$1(a.jb,a);c||(c=new U("//www.google.com/images/cleardot.gif"),l.location&&"http"==l.location.protocol||Oc(c,"https"),jc$1(c));nd(c.toString(),d);}else J$1(2);a.G=0;a.j&&a.j.va(b);Ld(a);Jd(a);}k.jb=function(a){a?(this.h.info("Successfully pinged google.com"),J$1(2)):(this.h.info("Failed to ping google.com"),J$1(1));};
+    function Ld(a){a.G=0;a.I=-1;if(a.j){if(0!=jd(a.i).length||0!=a.l.length)a.i.i.length=0,ra(a.l),a.l.length=0;a.j.ua();}}function Ec$1(a,b,c){let d=ad(c);if(""!=d.i)b&&Pc(d,b+"."+d.i),Qc$1(d,d.m);else {const e=l.location;d=bd(e.protocol,b?b+"."+e.hostname:e.hostname,+e.port,c);}a.aa&&xa(a.aa,function(e,f){R(d,f,e);});b=a.D;c=a.sa;b&&c&&R(d,b,c);R(d,"VER",a.ma);Kd(a,d);return d}
+    function nc$1(a,b,c){if(b&&!a.H)throw Error("Can't create secondary domain capable XhrIo object.");b=c&&a.Ba&&!a.qa?new X$1(new pd({ib:!0})):new X$1(a.qa);b.L=a.H;return b}function Sd(){}k=Sd.prototype;k.xa=function(){};k.wa=function(){};k.va=function(){};k.ua=function(){};k.Oa=function(){};function Td(){if(y&&!(10<=Number(Ua)))throw Error("Environmental error: no available transport.");}Td.prototype.g=function(a,b){return new Y$1(a,b)};
     function Y$1(a,b){C$1.call(this);this.g=new Id(b);this.l=a;this.h=b&&b.messageUrlParams||null;a=b&&b.messageHeaders||null;b&&b.clientProtocolHeaderRequired&&(a?a["X-Client-Protocol"]="webchannel":a={"X-Client-Protocol":"webchannel"});this.g.s=a;a=b&&b.initMessageHeaders||null;b&&b.messageContentType&&(a?a["X-WebChannel-Content-Type"]=b.messageContentType:a={"X-WebChannel-Content-Type":b.messageContentType});b&&b.ya&&(a?a["X-WebChannel-Client-Profile"]=b.ya:a={"X-WebChannel-Client-Profile":b.ya});this.g.P=
-    a;(a=b&&b.httpHeadersOverwriteParam)&&!sa$1(a)&&(this.g.o=a);this.A=b&&b.supportsCrossDomainXhr||!1;this.v=b&&b.sendRawJson||!1;(b=b&&b.httpSessionIdParam)&&!sa$1(b)&&(this.g.D=b,a=this.h,null!==a&&b in a&&(a=this.h,b in a&&delete a[b]));this.j=new Z$1(this);}t(Y$1,C$1);Y$1.prototype.m=function(){this.g.j=this.j;this.A&&(this.g.H=!0);var a=this.g,b=this.l,c=this.h||void 0;a.Wa&&(a.h.info("Origin Trials enabled."),zb(q$1(a.hb,a,b)));J$1(0);a.W=b;a.aa=c||{};a.N=a.X;a.F=Ec(a,null,a.W);Hc(a);};Y$1.prototype.close=function(){Ic$1(this.g);};
-    Y$1.prototype.u=function(a){if("string"===typeof a){var b={};b.__data__=a;Md(this.g,b);}else this.v?(b={},b.__data__=rb(a),Md(this.g,b)):Md(this.g,a);};Y$1.prototype.M=function(){this.g.j=null;delete this.j;Ic$1(this.g);delete this.g;Y$1.Z.M.call(this);};function Ud(a){ac.call(this);var b=a.__sm__;if(b){a:{for(const c in b){a=c;break a}a=void 0;}if(this.i=a)a=this.i,b=null!==b&&a in b?b[a]:void 0;this.data=b;}else this.data=a;}t(Ud,ac);function Vd(){bc$1.call(this);this.status=1;}t(Vd,bc$1);function Z$1(a){this.g=a;}
+    a;(a=b&&b.httpHeadersOverwriteParam)&&!sa(a)&&(this.g.o=a);this.A=b&&b.supportsCrossDomainXhr||!1;this.v=b&&b.sendRawJson||!1;(b=b&&b.httpSessionIdParam)&&!sa(b)&&(this.g.D=b,a=this.h,null!==a&&b in a&&(a=this.h,b in a&&delete a[b]));this.j=new Z$1(this);}t(Y$1,C$1);Y$1.prototype.m=function(){this.g.j=this.j;this.A&&(this.g.H=!0);var a=this.g,b=this.l,c=this.h||void 0;a.Wa&&(a.h.info("Origin Trials enabled."),zb(q$1(a.hb,a,b)));J$1(0);a.W=b;a.aa=c||{};a.N=a.X;a.F=Ec$1(a,null,a.W);Hc(a);};Y$1.prototype.close=function(){Ic(this.g);};
+    Y$1.prototype.u=function(a){if("string"===typeof a){var b={};b.__data__=a;Md(this.g,b);}else this.v?(b={},b.__data__=rb(a),Md(this.g,b)):Md(this.g,a);};Y$1.prototype.M=function(){this.g.j=null;delete this.j;Ic(this.g);delete this.g;Y$1.Z.M.call(this);};function Ud(a){ac$1.call(this);var b=a.__sm__;if(b){a:{for(const c in b){a=c;break a}a=void 0;}if(this.i=a)a=this.i,b=null!==b&&a in b?b[a]:void 0;this.data=b;}else this.data=a;}t(Ud,ac$1);function Vd(){bc.call(this);this.status=1;}t(Vd,bc);function Z$1(a){this.g=a;}
     t(Z$1,Sd);Z$1.prototype.xa=function(){D$1(this.g,"a");};Z$1.prototype.wa=function(a){D$1(this.g,new Ud(a));};Z$1.prototype.va=function(a){D$1(this.g,new Vd(a));};Z$1.prototype.ua=function(){D$1(this.g,"b");};/*
 
      Copyright 2017 Google LLC
@@ -2030,7 +3844,7 @@ var app = (function () {
      * See the License for the specific language governing permissions and
      * limitations under the License.
      */
-    let C = "9.1.3";
+    let C = "9.2.0";
 
     /**
      * @license
@@ -2804,11 +4618,11 @@ var app = (function () {
         return e;
     }
 
-    function at(t, e) {
+    function ct(t, e) {
         for (const n in t) Object.prototype.hasOwnProperty.call(t, n) && e(n, t[n]);
     }
 
-    function ct(t) {
+    function at(t) {
         for (const e in t) if (Object.prototype.hasOwnProperty.call(t, e)) return !1;
         return !0;
     }
@@ -3573,7 +5387,7 @@ var app = (function () {
                     fields: {}
                 }
             };
-            return at(t.mapValue.fields, ((t, n) => e.mapValue.fields[t] = Bt(n))), e;
+            return ct(t.mapValue.fields, ((t, n) => e.mapValue.fields[t] = Bt(n))), e;
         }
         if (t.arrayValue) {
             const e = {
@@ -3688,7 +5502,7 @@ var app = (function () {
          * Modifies `fieldsMap` by adding, replacing or deleting the specified
          * entries.
          */    applyChanges(t, e, n) {
-            at(e, ((e, n) => t[e] = n));
+            ct(e, ((e, n) => t[e] = n));
             for (const e of n) delete t[e];
         }
         clone() {
@@ -3700,7 +5514,7 @@ var app = (function () {
      * Returns a FieldMask built from all fields in a MapValue.
      */ function qt(t) {
         const e = [];
-        return at(t.fields, ((t, n) => {
+        return ct(t.fields, ((t, n) => {
             const s = new ft([ t ]);
             if (Lt(n)) {
                 const t = qt(n.mapValue).fields;
@@ -3876,7 +5690,7 @@ var app = (function () {
                 // TODO(b/29183165): Make this collision robust.
                 return t.field.canonicalString() + t.dir;
             }(t))).join(","), At(e.limit) || (t += "|l:", t += e.limit), e.startAt && (t += "|lb:", 
-            t += ae(e.startAt)), e.endAt && (t += "|ub:", t += ae(e.endAt)), e.A = t;
+            t += ce(e.startAt)), e.endAt && (t += "|ub:", t += ce(e.endAt)), e.A = t;
         }
         return e.A;
     }
@@ -3891,7 +5705,7 @@ var app = (function () {
         /** Filter that matches on key fields (i.e. '__name__'). */    })).join(", ")}]`), 
         At(t.limit) || (e += ", limit: " + t.limit), t.orderBy.length > 0 && (e += `, orderBy: [${t.orderBy.map((t => function(t) {
         return `${t.field.canonicalString()} (${t.dir})`;
-    }(t))).join(", ")}]`), t.startAt && (e += ", startAt: " + ae(t.startAt)), t.endAt && (e += ", endAt: " + ae(t.endAt)), 
+    }(t))).join(", ")}]`), t.startAt && (e += ", startAt: " + ce(t.startAt)), t.endAt && (e += ", endAt: " + ce(t.endAt)), 
         `Target(${e})`;
     }
 
@@ -4059,14 +5873,14 @@ var app = (function () {
         }
     }
 
-    function ae(t) {
+    function ce(t) {
         // TODO(b/29183165): Make this collision robust.
         return `${t.before ? "b" : "a"}:${t.position.map((t => Nt(t))).join(",")}`;
     }
 
     /**
      * An ordering on a field, in some Direction. Direction defaults to ASCENDING.
-     */ class ce {
+     */ class ae {
         constructor(t, e = "asc" /* ASCENDING */) {
             this.field = t, this.dir = e;
         }
@@ -4128,16 +5942,16 @@ var app = (function () {
          * Initializes a Query with a path and optional additional query constraints.
          * Path must currently be empty if this is a collection group query.
          */
-        constructor(t, e = null, n = [], s = [], i = null, r = "F" /* First */ , o = null, a = null) {
+        constructor(t, e = null, n = [], s = [], i = null, r = "F" /* First */ , o = null, c = null) {
             this.path = t, this.collectionGroup = e, this.explicitOrderBy = n, this.filters = s, 
-            this.limit = i, this.limitType = r, this.startAt = o, this.endAt = a, this.V = null, 
+            this.limit = i, this.limitType = r, this.startAt = o, this.endAt = c, this.V = null, 
             // The corresponding `Target` of this `Query` instance.
             this.S = null, this.startAt, this.endAt;
         }
     }
 
-    /** Creates a new Query instance with the options provided. */ function de(t, e, n, s, i, r, o, a) {
-        return new fe(t, e, n, s, i, r, o, a);
+    /** Creates a new Query instance with the options provided. */ function de(t, e, n, s, i, r, o, c) {
+        return new fe(t, e, n, s, i, r, o, c);
     }
 
     /** Creates a new Query for a query that matches all documents at `path` */ function we(t) {
@@ -4191,14 +6005,14 @@ var app = (function () {
             // In order to implicitly add key ordering, we must also add the
             // inequality filter field for it to be a valid query.
             // Note that the default inequality field and key ordering is ascending.
-            t.isKeyField() || e.V.push(new ce(t)), e.V.push(new ce(ft.keyField(), "asc" /* ASCENDING */)); else {
+            t.isKeyField() || e.V.push(new ae(t)), e.V.push(new ae(ft.keyField(), "asc" /* ASCENDING */)); else {
                 let t = !1;
                 for (const n of e.explicitOrderBy) e.V.push(n), n.field.isKeyField() && (t = !0);
                 if (!t) {
                     // The order of the implicit key ordering always matches the last
                     // explicit order by
                     const t = e.explicitOrderBy.length > 0 ? e.explicitOrderBy[e.explicitOrderBy.length - 1].dir : "asc" /* ASCENDING */;
-                    e.V.push(new ce(ft.keyField(), t));
+                    e.V.push(new ae(ft.keyField(), t));
                 }
             }
         }
@@ -4214,7 +6028,7 @@ var app = (function () {
             const t = [];
             for (const n of Te(e)) {
                 const e = "desc" /* DESCENDING */ === n.dir ? "asc" /* ASCENDING */ : "desc" /* DESCENDING */;
-                t.push(new ce(n.field, e));
+                t.push(new ae(n.field, e));
             }
             // We need to swap the cursors to match the now-flipped query ordering.
                     const n = e.endAt ? new oe(e.endAt.position, !e.endAt.before) : null, s = e.startAt ? new oe(e.startAt.position, !e.startAt.before) : null;
@@ -4769,8 +6583,8 @@ var app = (function () {
         const s = new Map;
         B(t.length === n.length);
         for (let i = 0; i < n.length; i++) {
-            const r = t[i], o = r.transform, a = e.data.field(r.field);
-            s.set(r.field, ke(o, a, n[i]));
+            const r = t[i], o = r.transform, c = e.data.field(r.field);
+            s.set(r.field, ke(o, c, n[i]));
         }
         return s;
     }
@@ -4795,13 +6609,13 @@ var app = (function () {
         return s;
     }
 
-    /** A mutation that deletes the document at the given key. */ class an extends He {
+    /** A mutation that deletes the document at the given key. */ class cn extends He {
         constructor(t, e) {
             super(), this.key = t, this.precondition = e, this.type = 2 /* Delete */ , this.fieldTransforms = [];
         }
     }
 
-    class cn extends He {
+    class an extends He {
         constructor(t, e) {
             super(), this.key = t, this.precondition = e, this.type = 3 /* Verify */ , this.fieldTransforms = [];
         }
@@ -5783,10 +7597,10 @@ var app = (function () {
         /**
          * Processes and adds the DocumentWatchChange to the current set of changes.
          */    rt(t) {
-            for (const e of t.k) t.$ && t.$.isFoundDocument() ? this.ot(e, t.$) : this.at(e, t.key, t.$);
-            for (const e of t.removedTargetIds) this.at(e, t.key, t.$);
+            for (const e of t.k) t.$ && t.$.isFoundDocument() ? this.ot(e, t.$) : this.ct(e, t.key, t.$);
+            for (const e of t.removedTargetIds) this.ct(e, t.key, t.$);
         }
-        /** Processes and adds the WatchTargetChange to the current set of changes. */    ct(t) {
+        /** Processes and adds the WatchTargetChange to the current set of changes. */    at(t) {
             this.forEachTarget(t, (e => {
                 const n = this.ut(e);
                 switch (t.state) {
@@ -5854,7 +7668,7 @@ var app = (function () {
                     // until it is resolved, essentially exposing inconsistency between
                     // queries.
                     const n = new Pt(t.path);
-                    this.at(e, n, Kt.newNoDocument(n, rt.min()));
+                    this.ct(e, n, Kt.newNoDocument(n, rt.min()));
                 } else B(1 === n); else {
                     this.wt(e) !== n && (
                     // Existence filter mismatch: We reset the mapping and raise a new
@@ -5881,7 +7695,7 @@ var app = (function () {
                         // instead resulting in an explicit delete message and we could
                         // remove this special logic.
                         const e = new Pt(i.target.path);
-                        null !== this.nt.get(e) || this.gt(s, e) || this.at(s, e, Kt.newNoDocument(e, t));
+                        null !== this.nt.get(e) || this.gt(s, e) || this.ct(s, e, Kt.newNoDocument(e, t));
                     }
                     n.K && (e.set(s, n.W()), n.G());
                 }
@@ -5920,7 +7734,7 @@ var app = (function () {
          * to update the remote document cache.
          */
         // Visible for testing.
-        at(t, e, n) {
+        ct(t, e, n) {
             if (!this.ht(t)) return;
             const s = this.ut(t);
             this.gt(t, e) ? s.H(e, 1 /* Removed */) : 
@@ -5975,7 +7789,7 @@ var app = (function () {
          */    lt(t) {
             this.et.set(t, new kn);
             this.tt.getRemoteKeysForTarget(t).forEach((e => {
-                this.at(t, e, /*updatedDocument=*/ null);
+                this.ct(t, e, /*updatedDocument=*/ null);
             }));
         }
         /**
@@ -6147,7 +7961,7 @@ var app = (function () {
             }(e.targetChange.targetChangeType || "NO_CHANGE"), i = e.targetChange.targetIds || [], r = function(t, e) {
                 return t.D ? (B(void 0 === e || "string" == typeof e), _t.fromBase64String(e || "")) : (B(void 0 === e || e instanceof Uint8Array), 
                 _t.fromUint8Array(e || new Uint8Array));
-            }(t, e.targetChange.resumeToken), o = e.targetChange.cause, a = o && function(t) {
+            }(t, e.targetChange.resumeToken), o = e.targetChange.cause, c = o && function(t) {
                 const e = void 0 === t.code ? K.UNKNOWN : dn(t.code);
                 return new j(e, t.message || "");
             }
@@ -6159,7 +7973,7 @@ var app = (function () {
      * our generated proto interfaces say Int32Value must be. But GRPC actually
      * expects a { value: <number> } struct.
      */ (o);
-            n = new xn(s, i, r, a || null);
+            n = new xn(s, i, r, c || null);
         } else if ("documentChange" in e) {
             e.documentChange;
             const s = e.documentChange;
@@ -6168,14 +7982,14 @@ var app = (function () {
                 mapValue: {
                     fields: s.document.fields
                 }
-            }), a = Kt.newFoundDocument(i, r, o), c = s.targetIds || [], u = s.removedTargetIds || [];
-            n = new Cn(c, u, a.key, a);
+            }), c = Kt.newFoundDocument(i, r, o), a = s.targetIds || [], u = s.removedTargetIds || [];
+            n = new Cn(a, u, c.key, c);
         } else if ("documentDelete" in e) {
             e.documentDelete;
             const s = e.documentDelete;
             s.document;
-            const i = zn(t, s.document), r = s.readTime ? jn(s.readTime) : rt.min(), o = Kt.newNoDocument(i, r), a = s.removedTargetIds || [];
-            n = new Cn([], a, o.key, o);
+            const i = zn(t, s.document), r = s.readTime ? jn(s.readTime) : rt.min(), o = Kt.newNoDocument(i, r), c = s.removedTargetIds || [];
+            n = new Cn([], c, o.key, o);
         } else if ("documentRemove" in e) {
             e.documentRemove;
             const s = e.documentRemove;
@@ -6199,13 +8013,13 @@ var app = (function () {
         let n;
         if (e instanceof en) n = {
             update: Zn(t, e.key, e.value)
-        }; else if (e instanceof an) n = {
+        }; else if (e instanceof cn) n = {
             delete: Gn(t, e.key)
         }; else if (e instanceof nn) n = {
             update: Zn(t, e.key, e.data),
             updateMask: ps(e.fieldMask)
         }; else {
-            if (!(e instanceof cn)) return L();
+            if (!(e instanceof an)) return L();
             n = {
                 verify: Gn(t, e.key)
             };
@@ -6262,7 +8076,7 @@ var app = (function () {
         };
     }
 
-    function as(t, e) {
+    function cs(t, e) {
         // Dissect the path into parent, collectionId, and optional key filter.
         const n = {
             structuredQuery: {}
@@ -6346,7 +8160,7 @@ var app = (function () {
         e.endAt && (n.structuredQuery.endAt = ls(e.endAt)), n;
     }
 
-    function cs(t) {
+    function as(t) {
         let e = Jn(t.parent);
         const n = t.structuredQuery, s = n.from ? n.from.length : 0;
         let i = null;
@@ -6359,7 +8173,7 @@ var app = (function () {
         n.where && (r = hs(n.where));
         let o = [];
         n.orderBy && (o = n.orderBy.map((t => function(t) {
-            return new ce(ms(t.field), 
+            return new ae(ms(t.field), 
             // visible for testing
             function(t) {
                 switch (t) {
@@ -6376,15 +8190,15 @@ var app = (function () {
             // visible for testing
             (t.direction));
         }(t))));
-        let a = null;
-        n.limit && (a = function(t) {
+        let c = null;
+        n.limit && (c = function(t) {
             let e;
             return e = "object" == typeof t ? t.value : t, At(e) ? null : e;
         }(n.limit));
-        let c = null;
-        n.startAt && (c = fs(n.startAt));
+        let a = null;
+        n.startAt && (a = fs(n.startAt));
         let u = null;
-        return n.endAt && (u = fs(n.endAt)), de(e, i, o, r, a, "F" /* First */ , c, u);
+        return n.endAt && (u = fs(n.endAt)), de(e, i, o, r, c, "F" /* First */ , a, u);
     }
 
     function us(t, e) {
@@ -6877,7 +8691,7 @@ var app = (function () {
      * including features exists only in SDKs (for example: limit-to-last).
      */
     function _i(t) {
-        const e = cs({
+        const e = as({
             parent: t.parent,
             structuredQuery: t.structuredQuery
         });
@@ -7073,12 +8887,12 @@ var app = (function () {
             return !1;
         }
         forEach(t) {
-            at(this.inner, ((e, n) => {
+            ct(this.inner, ((e, n) => {
                 for (const [e, s] of n) t(e, s);
             }));
         }
         isEmpty() {
-            return ct(this.inner);
+            return at(this.inner);
         }
     }
 
@@ -7383,7 +9197,7 @@ var app = (function () {
      *   another document that is in the local cache.
      *
      * - Queries that have never been CURRENT or free of limbo documents.
-     */ class ar {
+     */ class cr {
         /** Sets the document view to query against. */
         $n(t) {
             this.On = t;
@@ -7471,7 +9285,7 @@ var app = (function () {
      * This is useful to implement optional features (like bundles) in free
      * functions, such that they are tree-shakeable.
      */
-    class cr {
+    class ar {
         constructor(
         /** Manages our in-memory or durable persistence. */
         t, e, n, s) {
@@ -7503,7 +9317,7 @@ var app = (function () {
     function ur(
     /** Manages our in-memory or durable persistence. */
     t, e, n, s) {
-        return new cr(t, e, n, s);
+        return new ar(t, e, n, s);
     }
 
     /**
@@ -7622,16 +9436,16 @@ var app = (function () {
                     i = n.Un;
             const o = [];
             e.targetChanges.forEach(((e, r) => {
-                const a = i.get(r);
-                if (!a) return;
+                const c = i.get(r);
+                if (!c) return;
                 // Only update the remote keys if the target is still active. This
                 // ensures that we can persist the updated target data along with
                 // the updated assignment.
                             o.push(n.ze.removeMatchingKeys(t, e.removedDocuments, r).next((() => n.ze.addMatchingKeys(t, e.addedDocuments, r))));
-                const c = e.resumeToken;
+                const a = e.resumeToken;
                 // Update the resume token if the change includes one.
-                            if (c.approximateByteSize() > 0) {
-                    const u = a.withResumeToken(c, s).withSequenceNumber(t.currentSequenceNumber);
+                            if (a.approximateByteSize() > 0) {
+                    const u = c.withResumeToken(a, s).withSequenceNumber(t.currentSequenceNumber);
                     i = i.insert(r, u), 
                     // Update the target data if there are target changes (or if
                     // sufficient time has passed since the last update).
@@ -7664,10 +9478,10 @@ var app = (function () {
                     }
                     /**
      * Notifies local store of the changed views to locally pin documents.
-     */ (a, u, e) && o.push(n.ze.updateTargetData(t, u));
+     */ (c, u, e) && o.push(n.ze.updateTargetData(t, u));
                 }
             }));
-            let a = Tn();
+            let c = Tn();
             // HACK: The only reason we allow a null snapshot version is so that we
             // can synthesize remote events when we get permission denied errors while
             // trying to resolve the state of a locally cached document that is in
@@ -7678,12 +9492,12 @@ var app = (function () {
             // Each loop iteration only affects its "own" doc, so it's safe to get all the remote
             // documents in advance in a single call.
             o.push(wr(t, r, e.documentUpdates, s, void 0).next((t => {
-                a = t;
+                c = t;
             }))), !s.isEqual(rt.min())) {
                 const e = n.ze.getLastRemoteSnapshotVersion(t).next((e => n.ze.setTargetsMetadata(t, t.currentSequenceNumber, s)));
                 o.push(e);
             }
-            return js.waitFor(o).next((() => r.apply(t))).next((() => n.Qn.vn(t, a))).next((() => a));
+            return js.waitFor(o).next((() => r.apply(t))).next((() => n.Qn.vn(t, c))).next((() => c));
         })).then((t => (n.Un = i, t)));
     }
 
@@ -7710,7 +9524,7 @@ var app = (function () {
         return n.forEach((t => r = r.add(t))), e.getEntries(t, r).next((t => {
             let r = Tn();
             return n.forEach(((n, o) => {
-                const a = t.get(n), c = (null == i ? void 0 : i.get(n)) || s;
+                const c = t.get(n), a = (null == i ? void 0 : i.get(n)) || s;
                 // Note: The order of the steps below is important, since we want
                 // to ensure that rejected limbo resolutions (which fabricate
                 // NoDocuments with SnapshotVersion.min()) never add documents to
@@ -7719,8 +9533,8 @@ var app = (function () {
                 // NoDocuments with SnapshotVersion.min() are used in manufactured
                 // events. We remove these documents from cache since we lost
                 // access.
-                e.removeEntry(n, c), r = r.insert(n, o)) : !a.isValidDocument() || o.version.compareTo(a.version) > 0 || 0 === o.version.compareTo(a.version) && a.hasPendingWrites ? (e.addEntry(o, c), 
-                r = r.insert(n, o)) : $("LocalStore", "Ignoring outdated watch update for ", n, ". Current version:", a.version, " Watch version:", o.version);
+                e.removeEntry(n, a), r = r.insert(n, o)) : !c.isValidDocument() || o.version.compareTo(c.version) > 0 || 0 === o.version.compareTo(c.version) && c.hasPendingWrites ? (e.addEntry(o, a), 
+                r = r.insert(n, o)) : $("LocalStore", "Ignoring outdated watch update for ", n, ". Current version:", c.version, " Watch version:", o.version);
             })), r;
         }));
     }
@@ -8294,16 +10108,16 @@ var app = (function () {
             return n && (this.lastRemoteSnapshotVersion = n), e > this.Is && (this.Is = e), 
             js.resolve();
         }
-        ae(t) {
+        ce(t) {
             this.Es.set(t.target, t);
             const e = t.targetId;
             e > this.highestTargetId && (this.Rs = new Ni(e), this.highestTargetId = e), t.sequenceNumber > this.Is && (this.Is = t.sequenceNumber);
         }
         addTargetData(t, e) {
-            return this.ae(e), this.targetCount += 1, js.resolve();
+            return this.ce(e), this.targetCount += 1, js.resolve();
         }
         updateTargetData(t, e) {
-            return this.ae(e), js.resolve();
+            return this.ce(e), js.resolve();
         }
         removeTargetData(t, e) {
             return this.Es.delete(e.target), this.As.cs(e.targetId), this.targetCount -= 1, 
@@ -8824,8 +10638,8 @@ var app = (function () {
                         $("Connection", 'RPC "' + t + '" completed.');
                     }
                 }));
-                const a = JSON.stringify(s);
-                o.send(e, "POST", a, n, 15);
+                const c = JSON.stringify(s);
+                o.send(e, "POST", c, n, 15);
             }));
         }
         ji(t, e) {
@@ -8872,22 +10686,22 @@ var app = (function () {
             isMobileCordova() || isReactNative() || isElectron() || isIE() || isUWP() || isBrowserExtension() || (r.httpHeadersOverwriteParam = "$httpHeaders");
             const o = n.join("");
             $("Connection", "Creating WebChannel: " + o, r);
-            const a = s.createWebChannel(o, r);
+            const c = s.createWebChannel(o, r);
             // WebChannel supports sending the first message with the handshake - saving
             // a network round trip. However, it will have to call send in the same
             // JS event loop as open. In order to enforce this, we delay actually
             // opening the WebChannel until send is called. Whether we have called
             // open is tracked with this variable.
-                    let c = !1, u = !1;
+                    let a = !1, u = !1;
             // A flag to determine whether the stream was closed (by us or through an
             // error/close event) to avoid delivering multiple close events or sending
             // on a closed stream
                     const h = new Gr({
                 vi: t => {
-                    u ? $("Connection", "Not sending because WebChannel is closed:", t) : (c || ($("Connection", "Opening WebChannel transport."), 
-                    a.open(), c = !0), $("Connection", "WebChannel sending:", t), a.send(t));
+                    u ? $("Connection", "Not sending because WebChannel is closed:", t) : (a || ($("Connection", "Opening WebChannel transport."), 
+                    c.open(), a = !0), $("Connection", "WebChannel sending:", t), c.send(t));
                 },
-                Vi: () => a.close()
+                Vi: () => c.close()
             }), g = (t, e, n) => {
                 // TODO(dimond): closure typing seems broken because WebChannel does
                 // not implement goog.events.Listenable
@@ -8905,13 +10719,13 @@ var app = (function () {
             // exception and rethrow using a setTimeout so they become visible again.
             // Note that eventually this function could go away if we are confident
             // enough the code is exception free.
-                    return g(a, WebChannel.EventType.OPEN, (() => {
+                    return g(c, WebChannel.EventType.OPEN, (() => {
                 u || $("Connection", "WebChannel transport opened.");
-            })), g(a, WebChannel.EventType.CLOSE, (() => {
+            })), g(c, WebChannel.EventType.CLOSE, (() => {
                 u || (u = !0, $("Connection", "WebChannel transport closed"), h.$i());
-            })), g(a, WebChannel.EventType.ERROR, (t => {
+            })), g(c, WebChannel.EventType.ERROR, (t => {
                 u || (u = !0, F("Connection", "WebChannel transport errored:", t), h.$i(new j(K.UNAVAILABLE, "The operation could not be completed")));
-            })), g(a, WebChannel.EventType.MESSAGE, (t => {
+            })), g(c, WebChannel.EventType.MESSAGE, (t => {
                 var e;
                 if (!u) {
                     const n = t.data[0];
@@ -8941,7 +10755,7 @@ var app = (function () {
                         }(t), n = i.message;
                         void 0 === e && (e = K.INTERNAL, n = "Unknown error status: " + t + " with message " + i.message), 
                         // Mark closed so no further events are propagated
-                        u = !0, h.$i(new j(e, n)), a.close();
+                        u = !0, h.$i(new j(e, n)), c.close();
                     } else $("Connection", "WebChannel received:", n), h.Oi(n);
                 }
             })), g(i, Event.STAT_EVENT, (t => {
@@ -9116,15 +10930,15 @@ var app = (function () {
      *  ListenerType: The type of the listener that will be used for callbacks
      */
     class Zr {
-        constructor(t, e, n, s, i, r) {
-            this.Oe = t, this.er = n, this.nr = s, this.credentialsProvider = i, this.listener = r, 
-            this.state = 0 /* Initial */ , 
+        constructor(t, e, n, s, i, r, o) {
+            this.Oe = t, this.er = n, this.nr = s, this.sr = i, this.credentialsProvider = r, 
+            this.listener = o, this.state = 0 /* Initial */ , 
             /**
              * A close count that's incremented every time the stream is closed; used by
              * getCloseGuardedDispatcher() to invalidate callbacks that happen after
              * close.
              */
-            this.sr = 0, this.ir = null, this.stream = null, this.rr = new Xr(t, e);
+            this.ir = 0, this.rr = null, this.cr = null, this.stream = null, this.ar = new Xr(t, e);
         }
         /**
          * Returns true if start() has been called and no error has occurred. True
@@ -9132,14 +10946,14 @@ var app = (function () {
          * encompasses respecting backoff, getting auth tokens, and starting the
          * actual RPC). Use isOpen() to determine if the stream is open and ready for
          * outbound requests.
-         */    ar() {
-            return 1 /* Starting */ === this.state || 2 /* Open */ === this.state || 4 /* Backoff */ === this.state;
+         */    ur() {
+            return 1 /* Starting */ === this.state || 5 /* Backoff */ === this.state || this.hr();
         }
         /**
          * Returns true if the underlying RPC is open (the onOpen() listener has been
          * called) and the stream is ready for outbound requests.
-         */    cr() {
-            return 2 /* Open */ === this.state;
+         */    hr() {
+            return 2 /* Open */ === this.state || 3 /* Healthy */ === this.state;
         }
         /**
          * Starts the RPC. Only allowed if isStarted() returns false. The stream is
@@ -9148,7 +10962,7 @@ var app = (function () {
          *
          * When start returns, isStarted() will return true.
          */    start() {
-            3 /* Error */ !== this.state ? this.auth() : this.ur();
+            4 /* Error */ !== this.state ? this.auth() : this.lr();
         }
         /**
          * Stops the RPC. This call is idempotent and allowed regardless of the
@@ -9156,7 +10970,7 @@ var app = (function () {
          *
          * When stop returns, isStarted() and isOpen() will both return false.
          */    async stop() {
-            this.ar() && await this.close(0 /* Initial */);
+            this.ur() && await this.close(0 /* Initial */);
         }
         /**
          * After an error the stream will usually back off on the next attempt to
@@ -9165,8 +10979,8 @@ var app = (function () {
          *
          * Each error will call the onClose() listener. That function can decide to
          * inhibit backoff if required.
-         */    hr() {
-            this.state = 0 /* Initial */ , this.rr.reset();
+         */    dr() {
+            this.state = 0 /* Initial */ , this.ar.reset();
         }
         /**
          * Marks this stream as idle. If no further actions are performed on the
@@ -9177,22 +10991,25 @@ var app = (function () {
          *
          * Only streams that are in state 'Open' can be marked idle, as all other
          * states imply pending network operations.
-         */    lr() {
+         */    wr() {
             // Starts the idle time if we are in state 'Open' and are not yet already
             // running a timer (in which case the previous idle timeout still applies).
-            this.cr() && null === this.ir && (this.ir = this.Oe.enqueueAfterDelay(this.er, 6e4, (() => this.dr())));
+            this.hr() && null === this.rr && (this.rr = this.Oe.enqueueAfterDelay(this.er, 6e4, (() => this._r())));
         }
-        /** Sends a message to the underlying stream. */    wr(t) {
-            this._r(), this.stream.send(t);
+        /** Sends a message to the underlying stream. */    mr(t) {
+            this.gr(), this.stream.send(t);
         }
-        /** Called by the idle timer when the stream should close due to inactivity. */    async dr() {
-            if (this.cr()) 
+        /** Called by the idle timer when the stream should close due to inactivity. */    async _r() {
+            if (this.hr()) 
             // When timing out an idle stream there's no reason to force the stream into backoff when
             // it restarts so set the stream state to Initial instead of Error.
             return this.close(0 /* Initial */);
         }
-        /** Marks the stream as active again. */    _r() {
-            this.ir && (this.ir.cancel(), this.ir = null);
+        /** Marks the stream as active again. */    gr() {
+            this.rr && (this.rr.cancel(), this.rr = null);
+        }
+        /** Cancels the health check delayed operation. */    yr() {
+            this.cr && (this.cr.cancel(), this.cr = null);
         }
         /**
          * Closes the stream and cleans up as necessary:
@@ -9208,20 +11025,24 @@ var app = (function () {
          * @param error - the error the connection was closed with.
          */    async close(t, e) {
             // Cancel any outstanding timers (they're guaranteed not to execute).
-            this._r(), this.rr.cancel(), 
+            this.gr(), this.yr(), this.ar.cancel(), 
             // Invalidates any stream-related callbacks (e.g. from auth or the
             // underlying stream), guaranteeing they won't execute.
-            this.sr++, 3 /* Error */ !== t ? 
+            this.ir++, 4 /* Error */ !== t ? 
             // If this is an intentional close ensure we don't delay our next connection attempt.
-            this.rr.reset() : e && e.code === K.RESOURCE_EXHAUSTED ? (
+            this.ar.reset() : e && e.code === K.RESOURCE_EXHAUSTED ? (
             // Log the error. (Probably either 'quota exceeded' or 'max queue length reached'.)
             O(e.toString()), O("Using maximum backoff delay to prevent overloading the backend."), 
-            this.rr.Yi()) : e && e.code === K.UNAUTHENTICATED && 
-            // "unauthenticated" error means the token was rejected. Try force refreshing it in case it
-            // just expired.
+            this.ar.Yi()) : e && e.code === K.UNAUTHENTICATED && 3 /* Healthy */ !== this.state && 
+            // "unauthenticated" error means the token was rejected. This should rarely
+            // happen since both Auth and AppCheck ensure a sufficient TTL when we
+            // request a token. If a user manually resets their system clock this can
+            // fail, however. In this case, we should get a Code.UNAUTHENTICATED error
+            // before we received the first message and we need to invalidate the token
+            // to ensure that we fetch a new token.
             this.credentialsProvider.invalidateToken(), 
             // Clean up the underlying stream because we are no longer interested in events.
-            null !== this.stream && (this.mr(), this.stream.close(), this.stream = null), 
+            null !== this.stream && (this.pr(), this.stream.close(), this.stream = null), 
             // This state must be assigned before calling onClose() to allow the callback to
             // inhibit backoff or otherwise manipulate the state in its non-started state.
             this.state = t, 
@@ -9231,59 +11052,60 @@ var app = (function () {
         /**
          * Can be overridden to perform additional cleanup before the stream is closed.
          * Calling super.tearDown() is not required.
-         */    mr() {}
+         */    pr() {}
         auth() {
             this.state = 1 /* Starting */;
-            const t = this.gr(this.sr), e = this.sr;
+            const t = this.Tr(this.ir), e = this.ir;
             // TODO(mikelehen): Just use dispatchIfNotClosed, but see TODO below.
                     this.credentialsProvider.getToken().then((t => {
                 // Stream can be stopped while waiting for authentication.
                 // TODO(mikelehen): We really should just use dispatchIfNotClosed
                 // and let this dispatch onto the queue, but that opened a spec test can
                 // of worms that I don't want to deal with in this PR.
-                this.sr === e && 
+                this.ir === e && 
                 // Normally we'd have to schedule the callback on the AsyncQueue.
                 // However, the following calls are safe to be called outside the
                 // AsyncQueue since they don't chain asynchronous calls
-                this.yr(t);
+                this.Er(t);
             }), (e => {
                 t((() => {
                     const t = new j(K.UNKNOWN, "Fetching auth token failed: " + e.message);
-                    return this.pr(t);
+                    return this.Ir(t);
                 }));
             }));
         }
-        yr(t) {
-            const e = this.gr(this.sr);
-            this.stream = this.Tr(t), this.stream.Si((() => {
-                e((() => (this.state = 2 /* Open */ , this.listener.Si())));
+        Er(t) {
+            const e = this.Tr(this.ir);
+            this.stream = this.Ar(t), this.stream.Si((() => {
+                e((() => (this.state = 2 /* Open */ , this.cr = this.Oe.enqueueAfterDelay(this.nr, 1e4, (() => (this.hr() && (this.state = 3 /* Healthy */), 
+                Promise.resolve()))), this.listener.Si())));
             })), this.stream.Ci((t => {
-                e((() => this.pr(t)));
+                e((() => this.Ir(t)));
             })), this.stream.onMessage((t => {
                 e((() => this.onMessage(t)));
             }));
         }
-        ur() {
-            this.state = 4 /* Backoff */ , this.rr.Xi((async () => {
+        lr() {
+            this.state = 5 /* Backoff */ , this.ar.Xi((async () => {
                 this.state = 0 /* Initial */ , this.start();
             }));
         }
         // Visible for tests
-        pr(t) {
+        Ir(t) {
             // In theory the stream could close cleanly, however, in our current model
             // we never expect this to happen because if we stop a stream ourselves,
             // this callback will never be called. To prevent cases where we retry
             // without a backoff accidentally, we set the stream to error in all cases.
-            return $("PersistentStream", `close with error: ${t}`), this.stream = null, this.close(3 /* Error */ , t);
+            return $("PersistentStream", `close with error: ${t}`), this.stream = null, this.close(4 /* Error */ , t);
         }
         /**
          * Returns a "dispatcher" function that dispatches operations onto the
          * AsyncQueue but only runs them if closeCount remains unchanged. This allows
          * us to turn auth / stream callbacks into no-ops if the stream is closed /
          * re-opened, etc.
-         */    gr(t) {
+         */    Tr(t) {
             return e => {
-                this.Oe.enqueueAndForget((() => this.sr === t ? e() : ($("PersistentStream", "stream callback skipped by getCloseGuardedDispatcher."), 
+                this.Oe.enqueueAndForget((() => this.ir === t ? e() : ($("PersistentStream", "stream callback skipped by getCloseGuardedDispatcher."), 
                 Promise.resolve())));
             };
         }
@@ -9297,15 +11119,15 @@ var app = (function () {
      * sent from the server for ListenResponses.
      */ class to extends Zr {
         constructor(t, e, n, s, i) {
-            super(t, "listen_stream_connection_backoff" /* ListenStreamConnectionBackoff */ , "listen_stream_idle" /* ListenStreamIdle */ , e, n, i), 
+            super(t, "listen_stream_connection_backoff" /* ListenStreamConnectionBackoff */ , "listen_stream_idle" /* ListenStreamIdle */ , "health_check_timeout" /* HealthCheckTimeout */ , e, n, i), 
             this.N = s;
         }
-        Tr(t) {
-            return this.nr.ji("Listen", t);
+        Ar(t) {
+            return this.sr.ji("Listen", t);
         }
         onMessage(t) {
             // A successful response means the stream is healthy
-            this.rr.reset();
+            this.ar.reset();
             const e = ns(this.N, t), n = function(t) {
                 // We have only reached a consistent snapshot for the entire stream if there
                 // is a read_time set and it applies to all targets (i.e. the list of
@@ -9314,14 +11136,14 @@ var app = (function () {
                 const e = t.targetChange;
                 return e.targetIds && e.targetIds.length ? rt.min() : e.readTime ? jn(e.readTime) : rt.min();
             }(t);
-            return this.listener.Er(e, n);
+            return this.listener.Rr(e, n);
         }
         /**
          * Registers interest in the results of the given target. If the target
          * includes a resumeToken it will be included in the request. Results that
          * affect the target will be streamed back as WatchChange messages that
          * reference the targetId.
-         */    Ir(t) {
+         */    br(t) {
             const e = {};
             e.database = Yn(this.N), e.addTarget = function(t, e) {
                 let n;
@@ -9329,7 +11151,7 @@ var app = (function () {
                 return n = Ht(s) ? {
                     documents: os(t, s)
                 } : {
-                    query: as(t, s)
+                    query: cs(t, s)
                 }, n.targetId = e.targetId, e.resumeToken.approximateByteSize() > 0 ? n.resumeToken = qn(t, e.resumeToken) : e.snapshotVersion.compareTo(rt.min()) > 0 && (
                 // TODO(wuandy): Consider removing above check because it is most likely true.
                 // Right now, many tests depend on this behaviour though (leaving min() out
@@ -9337,14 +11159,14 @@ var app = (function () {
                 n.readTime = Un(t, e.snapshotVersion.toTimestamp())), n;
             }(this.N, t);
             const n = us(this.N, t);
-            n && (e.labels = n), this.wr(e);
+            n && (e.labels = n), this.mr(e);
         }
         /**
          * Unregisters interest in the results of the target associated with the
          * given targetId.
-         */    Ar(t) {
+         */    Pr(t) {
             const e = {};
-            e.database = Yn(this.N), e.removeTarget = t, this.wr(e);
+            e.database = Yn(this.N), e.removeTarget = t, this.mr(e);
         }
     }
 
@@ -9366,55 +11188,55 @@ var app = (function () {
      * TODO(b/33271235): Use proto types
      */ class eo extends Zr {
         constructor(t, e, n, s, i) {
-            super(t, "write_stream_connection_backoff" /* WriteStreamConnectionBackoff */ , "write_stream_idle" /* WriteStreamIdle */ , e, n, i), 
-            this.N = s, this.Rr = !1;
+            super(t, "write_stream_connection_backoff" /* WriteStreamConnectionBackoff */ , "write_stream_idle" /* WriteStreamIdle */ , "health_check_timeout" /* HealthCheckTimeout */ , e, n, i), 
+            this.N = s, this.vr = !1;
         }
         /**
          * Tracks whether or not a handshake has been successfully exchanged and
          * the stream is ready to accept mutations.
-         */    get br() {
-            return this.Rr;
+         */    get Vr() {
+            return this.vr;
         }
         // Override of PersistentStream.start
         start() {
-            this.Rr = !1, this.lastStreamToken = void 0, super.start();
+            this.vr = !1, this.lastStreamToken = void 0, super.start();
         }
-        mr() {
-            this.Rr && this.Pr([]);
+        pr() {
+            this.vr && this.Sr([]);
         }
-        Tr(t) {
-            return this.nr.ji("Write", t);
+        Ar(t) {
+            return this.sr.ji("Write", t);
         }
         onMessage(t) {
             if (
             // Always capture the last stream token.
-            B(!!t.streamToken), this.lastStreamToken = t.streamToken, this.Rr) {
+            B(!!t.streamToken), this.lastStreamToken = t.streamToken, this.vr) {
                 // A successful first write response means the stream is healthy,
                 // Note, that we could consider a successful handshake healthy, however,
                 // the write itself might be causing an error we want to back off from.
-                this.rr.reset();
+                this.ar.reset();
                 const e = rs(t.writeResults, t.commitTime), n = jn(t.commitTime);
-                return this.listener.vr(n, e);
+                return this.listener.Dr(n, e);
             }
             // The first response is always the handshake response
-            return B(!t.writeResults || 0 === t.writeResults.length), this.Rr = !0, this.listener.Vr();
+            return B(!t.writeResults || 0 === t.writeResults.length), this.vr = !0, this.listener.Cr();
         }
         /**
          * Sends an initial streamToken to the server, performing the handshake
          * required to make the StreamingWrite RPC work. Subsequent
          * calls should wait until onHandshakeComplete was called.
-         */    Sr() {
+         */    Nr() {
             // TODO(dimond): Support stream resumption. We intentionally do not set the
             // stream token on the handshake, ignoring any stream token we might have.
             const t = {};
-            t.database = Yn(this.N), this.wr(t);
+            t.database = Yn(this.N), this.mr(t);
         }
-        /** Sends a group of mutations to the Firestore backend to apply. */    Pr(t) {
+        /** Sends a group of mutations to the Firestore backend to apply. */    Sr(t) {
             const e = {
                 streamToken: this.lastStreamToken,
                 writes: t.map((t => ss(this.N, t)))
             };
-            this.wr(e);
+            this.mr(e);
         }
     }
 
@@ -9445,25 +11267,25 @@ var app = (function () {
      */
     class no extends class {} {
         constructor(t, e, n) {
-            super(), this.credentials = t, this.nr = e, this.N = n, this.Dr = !1;
+            super(), this.credentials = t, this.sr = e, this.N = n, this.kr = !1;
         }
-        Cr() {
-            if (this.Dr) throw new j(K.FAILED_PRECONDITION, "The client has already been terminated.");
+        $r() {
+            if (this.kr) throw new j(K.FAILED_PRECONDITION, "The client has already been terminated.");
         }
         /** Gets an auth token and invokes the provided RPC. */    Li(t, e, n) {
-            return this.Cr(), this.credentials.getToken().then((s => this.nr.Li(t, e, n, s))).catch((t => {
+            return this.$r(), this.credentials.getToken().then((s => this.sr.Li(t, e, n, s))).catch((t => {
                 throw "FirebaseError" === t.name ? (t.code === K.UNAUTHENTICATED && this.credentials.invalidateToken(), 
                 t) : new j(K.UNKNOWN, t.toString());
             }));
         }
         /** Gets an auth token and invokes the provided RPC with streamed results. */    Ki(t, e, n) {
-            return this.Cr(), this.credentials.getToken().then((s => this.nr.Ki(t, e, n, s))).catch((t => {
+            return this.$r(), this.credentials.getToken().then((s => this.sr.Ki(t, e, n, s))).catch((t => {
                 throw "FirebaseError" === t.name ? (t.code === K.UNAUTHENTICATED && this.credentials.invalidateToken(), 
                 t) : new j(K.UNKNOWN, t.toString());
             }));
         }
         terminate() {
-            this.Dr = !0;
+            this.kr = !0;
         }
     }
 
@@ -9490,19 +11312,19 @@ var app = (function () {
              * maximum defined by MAX_WATCH_STREAM_FAILURES, we'll set the OnlineState to
              * Offline.
              */
-            this.Nr = 0, 
+            this.Or = 0, 
             /**
              * A timer that elapses after ONLINE_STATE_TIMEOUT_MS, at which point we
              * transition from OnlineState.Unknown to OnlineState.Offline without waiting
              * for the stream to actually fail (MAX_WATCH_STREAM_FAILURES times).
              */
-            this.kr = null, 
+            this.Fr = null, 
             /**
              * Whether the client should log a warning message if it fails to connect to
              * the backend (initially true, cleared after a successful stream, or if we've
              * logged the message already).
              */
-            this.$r = !0;
+            this.Mr = !0;
         }
         /**
          * Called by RemoteStore when a watch stream is started (including on each
@@ -9510,9 +11332,9 @@ var app = (function () {
          *
          * If this is the first attempt, it sets the OnlineState to Unknown and starts
          * the onlineStateTimer.
-         */    Or() {
-            0 === this.Nr && (this.Fr("Unknown" /* Unknown */), this.kr = this.asyncQueue.enqueueAfterDelay("online_state_timeout" /* OnlineStateTimeout */ , 1e4, (() => (this.kr = null, 
-            this.Mr("Backend didn't respond within 10 seconds."), this.Fr("Offline" /* Offline */), 
+         */    Lr() {
+            0 === this.Or && (this.Br("Unknown" /* Unknown */), this.Fr = this.asyncQueue.enqueueAfterDelay("online_state_timeout" /* OnlineStateTimeout */ , 1e4, (() => (this.Fr = null, 
+            this.Ur("Backend didn't respond within 10 seconds."), this.Br("Offline" /* Offline */), 
             Promise.resolve()))));
         }
         /**
@@ -9520,10 +11342,10 @@ var app = (function () {
          * failure. The first failure moves us to the 'Unknown' state. We then may
          * allow multiple failures (based on MAX_WATCH_STREAM_FAILURES) before we
          * actually transition to the 'Offline' state.
-         */    Lr(t) {
-            "Online" /* Online */ === this.state ? this.Fr("Unknown" /* Unknown */) : (this.Nr++, 
-            this.Nr >= 1 && (this.Br(), this.Mr(`Connection failed 1 times. Most recent error: ${t.toString()}`), 
-            this.Fr("Offline" /* Offline */)));
+         */    qr(t) {
+            "Online" /* Online */ === this.state ? this.Br("Unknown" /* Unknown */) : (this.Or++, 
+            this.Or >= 1 && (this.Kr(), this.Ur(`Connection failed 1 times. Most recent error: ${t.toString()}`), 
+            this.Br("Offline" /* Offline */)));
         }
         /**
          * Explicitly sets the OnlineState to the specified state.
@@ -9532,20 +11354,20 @@ var app = (function () {
          * Offline heuristics, so must not be used in place of
          * handleWatchStreamStart() and handleWatchStreamFailure().
          */    set(t) {
-            this.Br(), this.Nr = 0, "Online" /* Online */ === t && (
+            this.Kr(), this.Or = 0, "Online" /* Online */ === t && (
             // We've connected to watch at least once. Don't warn the developer
             // about being offline going forward.
-            this.$r = !1), this.Fr(t);
+            this.Mr = !1), this.Br(t);
         }
-        Fr(t) {
+        Br(t) {
             t !== this.state && (this.state = t, this.onlineStateHandler(t));
         }
-        Mr(t) {
+        Ur(t) {
             const e = `Could not reach Cloud Firestore backend. ${t}\nThis typically indicates that your device does not have a healthy Internet connection at the moment. The client will operate in offline mode until it is able to successfully connect to the backend.`;
-            this.$r ? (O(e), this.$r = !1) : $("OnlineStateTracker", e);
+            this.Mr ? (O(e), this.Mr = !1) : $("OnlineStateTracker", e);
         }
-        Br() {
-            null !== this.kr && (this.kr.cancel(), this.kr = null);
+        Kr() {
+            null !== this.Fr && (this.Fr.cancel(), this.Fr = null);
         }
     }
 
@@ -9590,7 +11412,7 @@ var app = (function () {
              * purely based on order, and so we can just shift() writes from the front of
              * the writePipeline as we receive responses.
              */
-            this.Ur = [], 
+            this.jr = [], 
             /**
              * A mapping of watched targets that the client cares about tracking and the
              * user has explicitly called a 'listen' for this target.
@@ -9600,12 +11422,12 @@ var app = (function () {
              * to the server. The targets removed with unlistens are removed eagerly
              * without waiting for confirmation from the listen stream.
              */
-            this.qr = new Map, 
+            this.Qr = new Map, 
             /**
              * A set of reasons for why the RemoteStore may be offline. If empty, the
              * RemoteStore may start its network connections.
              */
-            this.Kr = new Set, 
+            this.Wr = new Set, 
             /**
              * Event handlers that get called when the network is disabled or enabled.
              *
@@ -9613,7 +11435,7 @@ var app = (function () {
              * underlying streams (to support tree-shakeable streams). On Android and iOS,
              * the streams are created during construction of RemoteStore.
              */
-            this.jr = [], this.Qr = i, this.Qr.Ti((t => {
+            this.Gr = [], this.zr = i, this.zr.Ti((t => {
                 n.enqueueAndForget((async () => {
                     // Porting Note: Unlike iOS, `restartNetwork()` is called even when the
                     // network becomes unreachable as we don't have any other way to tear
@@ -9621,55 +11443,55 @@ var app = (function () {
                     wo(this) && ($("RemoteStore", "Restarting streams for network reachability change."), 
                     await async function(t) {
                         const e = q(t);
-                        e.Kr.add(4 /* ConnectivityChange */), await oo(e), e.Wr.set("Unknown" /* Unknown */), 
-                        e.Kr.delete(4 /* ConnectivityChange */), await ro(e);
+                        e.Wr.add(4 /* ConnectivityChange */), await oo(e), e.Hr.set("Unknown" /* Unknown */), 
+                        e.Wr.delete(4 /* ConnectivityChange */), await ro(e);
                     }(this));
                 }));
-            })), this.Wr = new so(n, s);
+            })), this.Hr = new so(n, s);
         }
     }
 
     async function ro(t) {
-        if (wo(t)) for (const e of t.jr) await e(/* enabled= */ !0);
+        if (wo(t)) for (const e of t.Gr) await e(/* enabled= */ !0);
     }
 
     /**
      * Temporarily disables the network. The network can be re-enabled using
      * enableNetwork().
      */ async function oo(t) {
-        for (const e of t.jr) await e(/* enabled= */ !1);
+        for (const e of t.Gr) await e(/* enabled= */ !1);
     }
 
     /**
      * Starts new listen for the given target. Uses resume token if provided. It
      * is a no-op if the target of given `TargetData` is already being listened to.
      */
-    function ao(t, e) {
+    function co(t, e) {
         const n = q(t);
-        n.qr.has(e.targetId) || (
+        n.Qr.has(e.targetId) || (
         // Mark this as something the client is currently listening for.
-        n.qr.set(e.targetId, e), fo(n) ? 
+        n.Qr.set(e.targetId, e), fo(n) ? 
         // The listen will be sent in onWatchStreamOpen
-        lo(n) : Co(n).cr() && uo(n, e));
+        lo(n) : Co(n).hr() && uo(n, e));
     }
 
     /**
      * Removes the listen from server. It is a no-op if the given target id is
      * not being listened to.
-     */ function co(t, e) {
+     */ function ao(t, e) {
         const n = q(t), s = Co(n);
-        n.qr.delete(e), s.cr() && ho(n, e), 0 === n.qr.size && (s.cr() ? s.lr() : wo(n) && 
+        n.Qr.delete(e), s.hr() && ho(n, e), 0 === n.Qr.size && (s.hr() ? s.wr() : wo(n) && 
         // Revert to OnlineState.Unknown if the watch stream is not open and we
         // have no listeners, since without any listens to send we cannot
         // confirm if the stream is healthy and upgrade to OnlineState.Online.
-        n.Wr.set("Unknown" /* Unknown */));
+        n.Hr.set("Unknown" /* Unknown */));
     }
 
     /**
      * We need to increment the the expected number of pending responses we're due
      * from watch so we wait for the ack to process any messages from this target.
      */ function uo(t, e) {
-        t.Gr.Y(e.targetId), Co(t).Ir(e);
+        t.Jr.Y(e.targetId), Co(t).br(e);
     }
 
     /**
@@ -9677,33 +11499,33 @@ var app = (function () {
      * from watch so we wait for the removal on the server before we process any
      * messages from this target.
      */ function ho(t, e) {
-        t.Gr.Y(e), Co(t).Ar(e);
+        t.Jr.Y(e), Co(t).Pr(e);
     }
 
     function lo(t) {
-        t.Gr = new $n({
+        t.Jr = new $n({
             getRemoteKeysForTarget: e => t.remoteSyncer.getRemoteKeysForTarget(e),
-            Tt: e => t.qr.get(e) || null
-        }), Co(t).start(), t.Wr.Or();
+            Tt: e => t.Qr.get(e) || null
+        }), Co(t).start(), t.Hr.Lr();
     }
 
     /**
      * Returns whether the watch stream should be started because it's necessary
      * and has not yet been started.
      */ function fo(t) {
-        return wo(t) && !Co(t).ar() && t.qr.size > 0;
+        return wo(t) && !Co(t).ur() && t.Qr.size > 0;
     }
 
     function wo(t) {
-        return 0 === q(t).Kr.size;
+        return 0 === q(t).Wr.size;
     }
 
     function _o(t) {
-        t.Gr = void 0;
+        t.Jr = void 0;
     }
 
     async function mo(t) {
-        t.qr.forEach(((e, n) => {
+        t.Qr.forEach(((e, n) => {
             uo(t, e);
         }));
     }
@@ -9711,17 +11533,17 @@ var app = (function () {
     async function go(t, e) {
         _o(t), 
         // If we still need the watch stream, retry the connection.
-        fo(t) ? (t.Wr.Lr(e), lo(t)) : 
+        fo(t) ? (t.Hr.qr(e), lo(t)) : 
         // No need to restart watch stream because there are no active targets.
         // The online state is set to unknown because there is no active attempt
         // at establishing a connection
-        t.Wr.set("Unknown" /* Unknown */);
+        t.Hr.set("Unknown" /* Unknown */);
     }
 
     async function yo(t, e, n) {
         if (
         // Mark the client as online since we got a message from the server
-        t.Wr.set("Online" /* Online */), e instanceof xn && 2 /* Removed */ === e.state && e.cause) 
+        t.Hr.set("Online" /* Online */), e instanceof xn && 2 /* Removed */ === e.state && e.cause) 
         // There was an error on a target, don't wait for a consistent snapshot
         // to raise events
         try {
@@ -9731,7 +11553,7 @@ var app = (function () {
                 const n = e.cause;
                 for (const s of e.targetIds) 
                 // A watched target might have been removed already.
-                t.qr.has(s) && (await t.remoteSyncer.rejectListen(s, n), t.qr.delete(s), t.Gr.removeTarget(s));
+                t.Qr.has(s) && (await t.remoteSyncer.rejectListen(s, n), t.Qr.delete(s), t.Jr.removeTarget(s));
             }
             /**
      * Attempts to fill our write pipeline with writes from the LocalStore.
@@ -9744,7 +11566,7 @@ var app = (function () {
         } catch (n) {
             $("RemoteStore", "Failed to remove targets %s: %s ", e.targetIds.join(","), n), 
             await po(t, n);
-        } else if (e instanceof Cn ? t.Gr.rt(e) : e instanceof Nn ? t.Gr.ft(e) : t.Gr.ct(e), 
+        } else if (e instanceof Cn ? t.Jr.rt(e) : e instanceof Nn ? t.Jr.ft(e) : t.Jr.at(e), 
         !n.isEqual(rt.min())) try {
             const e = await fr(t.localStore);
             n.compareTo(e) >= 0 && 
@@ -9757,26 +11579,26 @@ var app = (function () {
      * SyncEngine.
      */
             function(t, e) {
-                const n = t.Gr._t(e);
+                const n = t.Jr._t(e);
                 // Update in-memory resume tokens. LocalStore will update the
                 // persistent view of these when applying the completed RemoteEvent.
                             return n.targetChanges.forEach(((n, s) => {
                     if (n.resumeToken.approximateByteSize() > 0) {
-                        const i = t.qr.get(s);
+                        const i = t.Qr.get(s);
                         // A watched target might have been removed already.
-                                            i && t.qr.set(s, i.withResumeToken(n.resumeToken, e));
+                                            i && t.Qr.set(s, i.withResumeToken(n.resumeToken, e));
                     }
                 })), 
                 // Re-establish listens for the targets that have been invalidated by
                 // existence filter mismatches.
                 n.targetMismatches.forEach((e => {
-                    const n = t.qr.get(e);
+                    const n = t.Qr.get(e);
                     if (!n) 
                     // A watched target might have been removed already.
                     return;
                     // Clear the resume token for the target, since we're in a known mismatch
                     // state.
-                                    t.qr.set(e, n.withResumeToken(_t.EMPTY_BYTE_STRING, n.snapshotVersion)), 
+                                    t.Qr.set(e, n.withResumeToken(_t.EMPTY_BYTE_STRING, n.snapshotVersion)), 
                     // Cause a hard reset by unwatching and rewatching immediately, but
                     // deliberately don't send a resume token so that we get a full update.
                     ho(t, e);
@@ -9803,16 +11625,16 @@ var app = (function () {
      * any retry attempt.
      */ async function po(t, e, n) {
         if (!Hs(e)) throw e;
-        t.Kr.add(1 /* IndexedDbFailed */), 
+        t.Wr.add(1 /* IndexedDbFailed */), 
         // Disable network and raise offline snapshots
-        await oo(t), t.Wr.set("Offline" /* Offline */), n || (
+        await oo(t), t.Hr.set("Offline" /* Offline */), n || (
         // Use a simple read operation to determine if IndexedDB recovered.
         // Ideally, we would expose a health check directly on SimpleDb, but
         // RemoteStore only has access to persistence through LocalStore.
         n = () => fr(t.localStore)), 
         // Probe IndexedDB periodically and re-enable network
         t.asyncQueue.enqueueRetryable((async () => {
-            $("RemoteStore", "Retrying IndexedDB access"), await n(), t.Kr.delete(1 /* IndexedDbFailed */), 
+            $("RemoteStore", "Retrying IndexedDB access"), await n(), t.Wr.delete(1 /* IndexedDbFailed */), 
             await ro(t);
         }));
     }
@@ -9826,11 +11648,11 @@ var app = (function () {
 
     async function Eo(t) {
         const e = q(t), n = No(e);
-        let s = e.Ur.length > 0 ? e.Ur[e.Ur.length - 1].batchId : -1;
+        let s = e.jr.length > 0 ? e.jr[e.jr.length - 1].batchId : -1;
         for (;Io(e); ) try {
             const t = await _r(e.localStore, s);
             if (null === t) {
-                0 === e.Ur.length && n.lr();
+                0 === e.jr.length && n.wr();
                 break;
             }
             s = t.batchId, Ao(e, t);
@@ -9844,20 +11666,20 @@ var app = (function () {
      * Returns true if we can add to the write pipeline (i.e. the network is
      * enabled and the write pipeline is not full).
      */ function Io(t) {
-        return wo(t) && t.Ur.length < 10;
+        return wo(t) && t.jr.length < 10;
     }
 
     /**
      * Queues additional writes to be sent to the write stream, sending them
      * immediately if the write stream is established.
      */ function Ao(t, e) {
-        t.Ur.push(e);
+        t.jr.push(e);
         const n = No(t);
-        n.cr() && n.br && n.Pr(e.mutations);
+        n.hr() && n.Vr && n.Sr(e.mutations);
     }
 
     function Ro(t) {
-        return wo(t) && !No(t).ar() && t.Ur.length > 0;
+        return wo(t) && !No(t).ur() && t.jr.length > 0;
     }
 
     function bo(t) {
@@ -9865,17 +11687,17 @@ var app = (function () {
     }
 
     async function Po(t) {
-        No(t).Sr();
+        No(t).Nr();
     }
 
     async function vo(t) {
         const e = No(t);
         // Send the write pipeline now that the stream is established.
-            for (const n of t.Ur) e.Pr(n.mutations);
+            for (const n of t.jr) e.Sr(n.mutations);
     }
 
     async function Vo(t, e, n) {
-        const s = t.Ur.shift(), i = si.from(s, e, n);
+        const s = t.jr.shift(), i = si.from(s, e, n);
         await To(t, (() => t.remoteSyncer.applySuccessfulWrite(i))), 
         // It's possible that with the completion of this mutation another
         // slot has freed up.
@@ -9885,7 +11707,7 @@ var app = (function () {
     async function So(t, e) {
         // If the write stream closed after the write handshake completes, a write
         // operation failed and we fail the pending operation.
-        e && No(t).br && 
+        e && No(t).Vr && 
         // This error affects the actual write.
         await async function(t, e) {
             // Only handle permanent errors here. If it's transient, just let the retry
@@ -9893,11 +11715,11 @@ var app = (function () {
             if (n = e.code, fn(n) && n !== K.ABORTED) {
                 // This was a permanent error, the request itself was the problem
                 // so it's not going to succeed if we resend it.
-                const n = t.Ur.shift();
+                const n = t.jr.shift();
                 // In this case it's also unlikely that the server itself is melting
                 // down -- this was just a bad request so inhibit backoff on the next
                 // restart.
-                            No(t).hr(), await To(t, (() => t.remoteSyncer.rejectFailedWrite(n.batchId, e))), 
+                            No(t).dr(), await To(t, (() => t.remoteSyncer.rejectFailedWrite(n.batchId, e))), 
                 // It's possible that with the completion of this mutation
                 // another slot has freed up.
                 await Eo(t);
@@ -9914,8 +11736,8 @@ var app = (function () {
      */
     async function Do(t, e) {
         const n = q(t);
-        e ? (n.Kr.delete(2 /* IsSecondary */), await ro(n)) : e || (n.Kr.add(2 /* IsSecondary */), 
-        await oo(n), n.Wr.set("Unknown" /* Unknown */));
+        e ? (n.Wr.delete(2 /* IsSecondary */), await ro(n)) : e || (n.Wr.add(2 /* IsSecondary */), 
+        await oo(n), n.Hr.set("Unknown" /* Unknown */));
     }
 
     /**
@@ -9926,11 +11748,11 @@ var app = (function () {
      * PORTING NOTE: On iOS and Android, the WatchStream gets registered on startup.
      * This is not done on Web to allow it to be tree-shaken.
      */ function Co(t) {
-        return t.zr || (
+        return t.Yr || (
         // Create stream (but note that it is not started yet).
-        t.zr = function(t, e, n) {
+        t.Yr = function(t, e, n) {
             const s = q(t);
-            return s.Cr(), new to(e, s.nr, s.credentials, s.N, n);
+            return s.$r(), new to(e, s.sr, s.credentials, s.N, n);
         }
         /**
      * @license
@@ -9950,11 +11772,11 @@ var app = (function () {
      */ (t.datastore, t.asyncQueue, {
             Si: mo.bind(null, t),
             Ci: go.bind(null, t),
-            Er: yo.bind(null, t)
-        }), t.jr.push((async e => {
-            e ? (t.zr.hr(), fo(t) ? lo(t) : t.Wr.set("Unknown" /* Unknown */)) : (await t.zr.stop(), 
+            Rr: yo.bind(null, t)
+        }), t.Gr.push((async e => {
+            e ? (t.Yr.dr(), fo(t) ? lo(t) : t.Hr.set("Unknown" /* Unknown */)) : (await t.Yr.stop(), 
             _o(t));
-        }))), t.zr;
+        }))), t.Yr;
     }
 
     /**
@@ -9965,22 +11787,22 @@ var app = (function () {
      * PORTING NOTE: On iOS and Android, the WriteStream gets registered on startup.
      * This is not done on Web to allow it to be tree-shaken.
      */ function No(t) {
-        return t.Hr || (
+        return t.Xr || (
         // Create stream (but note that it is not started yet).
-        t.Hr = function(t, e, n) {
+        t.Xr = function(t, e, n) {
             const s = q(t);
-            return s.Cr(), new eo(e, s.nr, s.credentials, s.N, n);
+            return s.$r(), new eo(e, s.sr, s.credentials, s.N, n);
         }(t.datastore, t.asyncQueue, {
             Si: Po.bind(null, t),
             Ci: So.bind(null, t),
-            Vr: vo.bind(null, t),
-            vr: Vo.bind(null, t)
-        }), t.jr.push((async e => {
-            e ? (t.Hr.hr(), 
+            Cr: vo.bind(null, t),
+            Dr: Vo.bind(null, t)
+        }), t.Gr.push((async e => {
+            e ? (t.Xr.dr(), 
             // This will start the write stream if necessary.
-            await Eo(t)) : (await t.Hr.stop(), t.Ur.length > 0 && ($("RemoteStore", `Stopping write stream with ${t.Ur.length} pending writes`), 
-            t.Ur = []));
-        }))), t.Hr;
+            await Eo(t)) : (await t.Xr.stop(), t.jr.length > 0 && ($("RemoteStore", `Stopping write stream with ${t.jr.length} pending writes`), 
+            t.jr = []));
+        }))), t.Xr;
     }
 
     /**
@@ -10190,25 +12012,25 @@ var app = (function () {
      * duplicate events for the same doc.
      */ class Oo {
         constructor() {
-            this.Jr = new wn(Pt.comparator);
+            this.Zr = new wn(Pt.comparator);
         }
         track(t) {
-            const e = t.doc.key, n = this.Jr.get(e);
+            const e = t.doc.key, n = this.Zr.get(e);
             n ? 
             // Merge the new change with the existing change.
-            0 /* Added */ !== t.type && 3 /* Metadata */ === n.type ? this.Jr = this.Jr.insert(e, t) : 3 /* Metadata */ === t.type && 1 /* Removed */ !== n.type ? this.Jr = this.Jr.insert(e, {
+            0 /* Added */ !== t.type && 3 /* Metadata */ === n.type ? this.Zr = this.Zr.insert(e, t) : 3 /* Metadata */ === t.type && 1 /* Removed */ !== n.type ? this.Zr = this.Zr.insert(e, {
                 type: n.type,
                 doc: t.doc
-            }) : 2 /* Modified */ === t.type && 2 /* Modified */ === n.type ? this.Jr = this.Jr.insert(e, {
+            }) : 2 /* Modified */ === t.type && 2 /* Modified */ === n.type ? this.Zr = this.Zr.insert(e, {
                 type: 2 /* Modified */ ,
                 doc: t.doc
-            }) : 2 /* Modified */ === t.type && 0 /* Added */ === n.type ? this.Jr = this.Jr.insert(e, {
+            }) : 2 /* Modified */ === t.type && 0 /* Added */ === n.type ? this.Zr = this.Zr.insert(e, {
                 type: 0 /* Added */ ,
                 doc: t.doc
-            }) : 1 /* Removed */ === t.type && 0 /* Added */ === n.type ? this.Jr = this.Jr.remove(e) : 1 /* Removed */ === t.type && 2 /* Modified */ === n.type ? this.Jr = this.Jr.insert(e, {
+            }) : 1 /* Removed */ === t.type && 0 /* Added */ === n.type ? this.Zr = this.Zr.remove(e) : 1 /* Removed */ === t.type && 2 /* Modified */ === n.type ? this.Zr = this.Zr.insert(e, {
                 type: 1 /* Removed */ ,
                 doc: n.doc
-            }) : 0 /* Added */ === t.type && 1 /* Removed */ === n.type ? this.Jr = this.Jr.insert(e, {
+            }) : 0 /* Added */ === t.type && 1 /* Removed */ === n.type ? this.Zr = this.Zr.insert(e, {
                 type: 2 /* Modified */ ,
                 doc: t.doc
             }) : 
@@ -10219,20 +12041,20 @@ var app = (function () {
             // Removed->Modified
             // Metadata->Added
             // Removed->Metadata
-            L() : this.Jr = this.Jr.insert(e, t);
+            L() : this.Zr = this.Zr.insert(e, t);
         }
-        Yr() {
+        eo() {
             const t = [];
-            return this.Jr.inorderTraversal(((e, n) => {
+            return this.Zr.inorderTraversal(((e, n) => {
                 t.push(n);
             })), t;
         }
     }
 
     class Fo {
-        constructor(t, e, n, s, i, r, o, a) {
+        constructor(t, e, n, s, i, r, o, c) {
             this.query = t, this.docs = e, this.oldDocs = n, this.docChanges = s, this.mutatedKeys = i, 
-            this.fromCache = r, this.syncStateChanged = o, this.excludesMetadataChanges = a;
+            this.fromCache = r, this.syncStateChanged = o, this.excludesMetadataChanges = c;
         }
         /** Returns a view snapshot as if all documents in the snapshot were added. */    static fromInitialDocuments(t, e, n, s) {
             const i = [];
@@ -10278,14 +12100,14 @@ var app = (function () {
      * tracked by EventManager.
      */ class Mo {
         constructor() {
-            this.Xr = void 0, this.listeners = [];
+            this.no = void 0, this.listeners = [];
         }
     }
 
     class Lo {
         constructor() {
             this.queries = new ji((t => Re(t)), Ae), this.onlineState = "Unknown" /* Unknown */ , 
-            this.Zr = new Set;
+            this.so = new Set;
         }
     }
 
@@ -10293,15 +12115,15 @@ var app = (function () {
         const n = q(t), s = e.query;
         let i = !1, r = n.queries.get(s);
         if (r || (i = !0, r = new Mo), i) try {
-            r.Xr = await n.onListen(s);
+            r.no = await n.onListen(s);
         } catch (t) {
             const n = ko(t, `Initialization of query '${be(e.query)}' failed`);
             return void e.onError(n);
         }
         if (n.queries.set(s, r), r.listeners.push(e), 
         // Run global snapshot listeners if a consistent snapshot has been emitted.
-        e.eo(n.onlineState), r.Xr) {
-            e.no(r.Xr) && jo(n);
+        e.io(n.onlineState), r.no) {
+            e.ro(r.no) && jo(n);
         }
     }
 
@@ -10322,8 +12144,8 @@ var app = (function () {
         for (const t of e) {
             const e = t.query, i = n.queries.get(e);
             if (i) {
-                for (const e of i.listeners) e.no(t) && (s = !0);
-                i.Xr = t;
+                for (const e of i.listeners) e.ro(t) && (s = !0);
+                i.no = t;
             }
         }
         s && jo(n);
@@ -10339,7 +12161,7 @@ var app = (function () {
 
     // Call all global snapshot listeners that have been set.
     function jo(t) {
-        t.Zr.forEach((t => {
+        t.so.forEach((t => {
             t.next();
         }));
     }
@@ -10351,19 +12173,19 @@ var app = (function () {
      * It uses an Observer to dispatch events.
      */ class Qo {
         constructor(t, e, n) {
-            this.query = t, this.so = e, 
+            this.query = t, this.oo = e, 
             /**
              * Initial snapshots (e.g. from cache) may not be propagated to the wrapped
              * observer. This flag is set to true once we've actually raised an event.
              */
-            this.io = !1, this.ro = null, this.onlineState = "Unknown" /* Unknown */ , this.options = n || {};
+            this.co = !1, this.ao = null, this.onlineState = "Unknown" /* Unknown */ , this.options = n || {};
         }
         /**
          * Applies the new ViewSnapshot to this listener, raising a user-facing event
          * if applicable (depending on what changed, whether the user has opted into
          * metadata-only changes, etc.). Returns true if a user-facing event was
          * indeed raised.
-         */    no(t) {
+         */    ro(t) {
             if (!this.options.includeMetadataChanges) {
                 // Remove the metadata only changes.
                 const e = [];
@@ -10372,19 +12194,19 @@ var app = (function () {
                 /* excludesMetadataChanges= */ !0);
             }
             let e = !1;
-            return this.io ? this.oo(t) && (this.so.next(t), e = !0) : this.ao(t, this.onlineState) && (this.co(t), 
-            e = !0), this.ro = t, e;
+            return this.co ? this.uo(t) && (this.oo.next(t), e = !0) : this.ho(t, this.onlineState) && (this.lo(t), 
+            e = !0), this.ao = t, e;
         }
         onError(t) {
-            this.so.error(t);
+            this.oo.error(t);
         }
-        /** Returns whether a snapshot was raised. */    eo(t) {
+        /** Returns whether a snapshot was raised. */    io(t) {
             this.onlineState = t;
             let e = !1;
-            return this.ro && !this.io && this.ao(this.ro, t) && (this.co(this.ro), e = !0), 
+            return this.ao && !this.co && this.ho(this.ao, t) && (this.lo(this.ao), e = !0), 
             e;
         }
-        ao(t, e) {
+        ho(t, e) {
             // Always raise the first event when we're synced
             if (!t.fromCache) return !0;
             // NOTE: We consider OnlineState.Unknown as online (it should become Offline
@@ -10392,24 +12214,24 @@ var app = (function () {
                     const n = "Offline" /* Offline */ !== e;
             // Don't raise the event if we're online, aren't synced yet (checked
             // above) and are waiting for a sync.
-                    return (!this.options.uo || !n) && (!t.docs.isEmpty() || "Offline" /* Offline */ === e);
+                    return (!this.options.fo || !n) && (!t.docs.isEmpty() || "Offline" /* Offline */ === e);
             // Raise data from cache if we have any documents or we are offline
             }
-        oo(t) {
+        uo(t) {
             // We don't need to handle includeDocumentMetadataChanges here because
             // the Metadata only changes have already been stripped out if needed.
             // At this point the only changes we will see are the ones we should
             // propagate.
             if (t.docChanges.length > 0) return !0;
-            const e = this.ro && this.ro.hasPendingWrites !== t.hasPendingWrites;
+            const e = this.ao && this.ao.hasPendingWrites !== t.hasPendingWrites;
             return !(!t.syncStateChanged && !e) && !0 === this.options.includeMetadataChanges;
             // Generally we should have hit one of the cases above, but it's possible
             // to get here if there were only metadata docChanges and they got
             // stripped out.
             }
-        co(t) {
-            t = Fo.fromInitialDocuments(t.query, t.docs, t.mutatedKeys, t.fromCache), this.io = !0, 
-            this.so.next(t);
+        lo(t) {
+            t = Fo.fromInitialDocuments(t.query, t.docs, t.mutatedKeys, t.fromCache), this.co = !0, 
+            this.oo.next(t);
         }
     }
 
@@ -10453,7 +12275,7 @@ var app = (function () {
         constructor(t, 
         /** Documents included in the remote target */
         e) {
-            this.query = t, this._o = e, this.mo = null, 
+            this.query = t, this.po = e, this.To = null, 
             /**
              * A flag whether the view is current with the backend. A view is considered
              * current after it has seen the current flag from the backend and did not
@@ -10462,15 +12284,15 @@ var app = (function () {
              */
             this.current = !1, 
             /** Documents in the view but not in the remote target */
-            this.yo = Pn(), 
+            this.Eo = Pn(), 
             /** Document Keys that have local changes */
-            this.mutatedKeys = Pn(), this.po = ve(t), this.To = new $o(this.po);
+            this.mutatedKeys = Pn(), this.Io = ve(t), this.Ao = new $o(this.Io);
         }
         /**
          * The set of remote documents that the server has told us belongs to the target associated with
          * this view.
-         */    get Eo() {
-            return this._o;
+         */    get Ro() {
+            return this.po;
         }
         /**
          * Iterates over a set of doc changes, applies the query limit, and computes
@@ -10481,8 +12303,8 @@ var app = (function () {
          * @param previousChanges - If this is being called with a refill, then start
          *        with this set of docs and changes instead of the current view.
          * @returns a new set of docs, changes, and refill flag.
-         */    Io(t, e) {
-            const n = e ? e.Ao : new Oo, s = e ? e.To : this.To;
+         */    bo(t, e) {
+            const n = e ? e.Po : new Oo, s = e ? e.Ao : this.Ao;
             let i = e ? e.mutatedKeys : this.mutatedKeys, r = s, o = !1;
             // Track the last doc in a (full) limit. This is necessary, because some
             // update (a delete, or an update moving a doc past the old limit) might
@@ -10492,7 +12314,7 @@ var app = (function () {
             // deletes. So we keep this doc at the old limit to compare the updates to.
             // Note that this should never get used in a refill (when previousChanges is
             // set), because there will only be adds -- no deletes or updates.
-            const a = _e(this.query) && s.size === this.query.limit ? s.last() : null, c = me(this.query) && s.size === this.query.limit ? s.first() : null;
+            const c = _e(this.query) && s.size === this.query.limit ? s.last() : null, a = me(this.query) && s.size === this.query.limit ? s.first() : null;
             // Drop documents out to meet limit/limitToLast requirement.
             if (t.inorderTraversal(((t, e) => {
                 const u = s.get(t), h = Pe(this.query, e) ? e : null, l = !!u && this.mutatedKeys.has(u.key), f = !!h && (h.hasLocalMutations || 
@@ -10505,10 +12327,10 @@ var app = (function () {
                     u.data.isEqual(h.data) ? l !== f && (n.track({
                         type: 3 /* Metadata */ ,
                         doc: h
-                    }), d = !0) : this.Ro(u, h) || (n.track({
+                    }), d = !0) : this.vo(u, h) || (n.track({
                         type: 2 /* Modified */ ,
                         doc: h
-                    }), d = !0, (a && this.po(h, a) > 0 || c && this.po(h, c) < 0) && (
+                    }), d = !0, (c && this.Io(h, c) > 0 || a && this.Io(h, a) < 0) && (
                     // This doc moved from inside the limit to outside the limit.
                     // That means there may be some other doc in the local cache
                     // that should be included instead.
@@ -10519,7 +12341,7 @@ var app = (function () {
                 }), d = !0) : u && !h && (n.track({
                     type: 1 /* Removed */ ,
                     doc: u
-                }), d = !0, (a || c) && (
+                }), d = !0, (c || a) && (
                 // A doc was removed from a full limit query. We'll need to
                 // requery from the local cache to see if we know about some other
                 // doc that should be in the results.
@@ -10533,13 +12355,13 @@ var app = (function () {
                 });
             }
             return {
-                To: r,
-                Ao: n,
+                Ao: r,
+                Po: n,
                 Ln: o,
                 mutatedKeys: i
             };
         }
-        Ro(t, e) {
+        vo(t, e) {
             // We suppress the initial change event for documents that were modified as
             // part of a write acknowledgment (e.g. when the value of a server transform
             // is applied) as Watch will send us the same document again.
@@ -10561,10 +12383,10 @@ var app = (function () {
          */
         // PORTING NOTE: The iOS/Android clients always compute limbo document changes.
         applyChanges(t, e, n) {
-            const s = this.To;
-            this.To = t.To, this.mutatedKeys = t.mutatedKeys;
+            const s = this.Ao;
+            this.Ao = t.Ao, this.mutatedKeys = t.mutatedKeys;
             // Sort changes based on type and query comparator
-            const i = t.Ao.Yr();
+            const i = t.Po.eo();
             i.sort(((t, e) => function(t, e) {
                 const n = t => {
                     switch (t) {
@@ -10602,68 +12424,68 @@ var app = (function () {
      * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
      * See the License for the specific language governing permissions and
      * limitations under the License.
-     */ (t.type, e.type) || this.po(t.doc, e.doc))), this.bo(n);
-            const r = e ? this.Po() : [], o = 0 === this.yo.size && this.current ? 1 /* Synced */ : 0 /* Local */ , a = o !== this.mo;
-            if (this.mo = o, 0 !== i.length || a) {
+     */ (t.type, e.type) || this.Io(t.doc, e.doc))), this.Vo(n);
+            const r = e ? this.So() : [], o = 0 === this.Eo.size && this.current ? 1 /* Synced */ : 0 /* Local */ , c = o !== this.To;
+            if (this.To = o, 0 !== i.length || c) {
                 return {
-                    snapshot: new Fo(this.query, t.To, s, i, t.mutatedKeys, 0 /* Local */ === o, a, 
+                    snapshot: new Fo(this.query, t.Ao, s, i, t.mutatedKeys, 0 /* Local */ === o, c, 
                     /* excludesMetadataChanges= */ !1),
-                    vo: r
+                    Do: r
                 };
             }
             // no changes
             return {
-                vo: r
+                Do: r
             };
         }
         /**
          * Applies an OnlineState change to the view, potentially generating a
          * ViewChange if the view's syncState changes as a result.
-         */    eo(t) {
+         */    io(t) {
             return this.current && "Offline" /* Offline */ === t ? (
             // If we're offline, set `current` to false and then call applyChanges()
             // to refresh our syncState and generate a ViewChange as appropriate. We
             // are guaranteed to get a new TargetChange that sets `current` back to
             // true once the client is back online.
             this.current = !1, this.applyChanges({
-                To: this.To,
-                Ao: new Oo,
+                Ao: this.Ao,
+                Po: new Oo,
                 mutatedKeys: this.mutatedKeys,
                 Ln: !1
             }, 
             /* updateLimboDocuments= */ !1)) : {
-                vo: []
+                Do: []
             };
         }
         /**
          * Returns whether the doc for the given key should be in limbo.
-         */    Vo(t) {
+         */    Co(t) {
             // If the remote end says it's part of this query, it's not in limbo.
-            return !this._o.has(t) && (
+            return !this.po.has(t) && (
             // The local store doesn't think it's a result, so it shouldn't be in limbo.
-            !!this.To.has(t) && !this.To.get(t).hasLocalMutations);
+            !!this.Ao.has(t) && !this.Ao.get(t).hasLocalMutations);
         }
         /**
          * Updates syncedDocuments, current, and limbo docs based on the given change.
          * Returns the list of changes to which docs are in limbo.
-         */    bo(t) {
-            t && (t.addedDocuments.forEach((t => this._o = this._o.add(t))), t.modifiedDocuments.forEach((t => {})), 
-            t.removedDocuments.forEach((t => this._o = this._o.delete(t))), this.current = t.current);
+         */    Vo(t) {
+            t && (t.addedDocuments.forEach((t => this.po = this.po.add(t))), t.modifiedDocuments.forEach((t => {})), 
+            t.removedDocuments.forEach((t => this.po = this.po.delete(t))), this.current = t.current);
         }
-        Po() {
+        So() {
             // We can only determine limbo documents when we're in-sync with the server.
             if (!this.current) return [];
             // TODO(klimt): Do this incrementally so that it's not quadratic when
             // updating many documents.
-                    const t = this.yo;
-            this.yo = Pn(), this.To.forEach((t => {
-                this.Vo(t.key) && (this.yo = this.yo.add(t.key));
+                    const t = this.Eo;
+            this.Eo = Pn(), this.Ao.forEach((t => {
+                this.Co(t.key) && (this.Eo = this.Eo.add(t.key));
             }));
             // Diff the new limbo docs with the old limbo docs.
             const e = [];
             return t.forEach((t => {
-                this.yo.has(t) || e.push(new Yo(t));
-            })), this.yo.forEach((n => {
+                this.Eo.has(t) || e.push(new Yo(t));
+            })), this.Eo.forEach((n => {
                 t.has(n) || e.push(new Jo(n));
             })), e;
         }
@@ -10687,9 +12509,9 @@ var app = (function () {
          * @returns The ViewChange that resulted from this synchronization.
          */
         // PORTING NOTE: Multi-tab only.
-        So(t) {
-            this._o = t.Gn, this.yo = Pn();
-            const e = this.Io(t.documents);
+        No(t) {
+            this.po = t.Gn, this.Eo = Pn();
+            const e = this.bo(t.documents);
             return this.applyChanges(e, /*updateLimboDocuments=*/ !0);
         }
         /**
@@ -10698,8 +12520,8 @@ var app = (function () {
          * `hasPendingWrites` status of the already established view.
          */
         // PORTING NOTE: Multi-tab only.
-        Do() {
-            return Fo.fromInitialDocuments(this.query, this.To, this.mutatedKeys, 0 /* Local */ === this.mo);
+        xo() {
+            return Fo.fromInitialDocuments(this.query, this.Ao, this.mutatedKeys, 0 /* Local */ === this.To);
         }
     }
 
@@ -10729,7 +12551,7 @@ var app = (function () {
         }
     }
 
-    /** Tracks a limbo resolution. */ class ta {
+    /** Tracks a limbo resolution. */ class tc {
         constructor(t) {
             this.key = t, 
             /**
@@ -10738,7 +12560,7 @@ var app = (function () {
              * decide whether it needs to manufacture a delete event for the target once
              * the target is CURRENT.
              */
-            this.Co = !1;
+            this.ko = !1;
         }
     }
 
@@ -10754,13 +12576,13 @@ var app = (function () {
      * the class is not exported so they are only accessible from this module.
      * This is useful to implement optional features (like bundles) in free
      * functions, such that they are tree-shakeable.
-     */ class ea {
+     */ class ec {
         constructor(t, e, n, 
         // PORTING NOTE: Manages state synchronization in multi-tab environments.
         s, i, r) {
             this.localStore = t, this.remoteStore = e, this.eventManager = n, this.sharedClientState = s, 
-            this.currentUser = i, this.maxConcurrentLimboResolutions = r, this.No = {}, this.xo = new ji((t => Re(t)), Ae), 
-            this.ko = new Map, 
+            this.currentUser = i, this.maxConcurrentLimboResolutions = r, this.$o = {}, this.Oo = new ji((t => Re(t)), Ae), 
+            this.Fo = new Map, 
             /**
              * The keys of documents that are in limbo for which we haven't yet started a
              * limbo resolution query. The strings in this set are the result of calling
@@ -10770,28 +12592,28 @@ var app = (function () {
              * of arbitrary elements and it also maintains insertion order, providing the
              * desired queue-like FIFO semantics.
              */
-            this.$o = new Set, 
+            this.Mo = new Set, 
             /**
              * Keeps track of the target ID for each document that is in limbo with an
              * active target.
              */
-            this.Oo = new wn(Pt.comparator), 
+            this.Lo = new wn(Pt.comparator), 
             /**
              * Keeps track of the information about an active limbo resolution for each
              * active target ID that was started for the purpose of limbo resolution.
              */
-            this.Fo = new Map, this.Mo = new br, 
+            this.Bo = new Map, this.Uo = new br, 
             /** Stores user completion handlers, indexed by User and BatchId. */
-            this.Lo = {}, 
+            this.qo = {}, 
             /** Stores user callbacks waiting for all pending writes to be acknowledged. */
-            this.Bo = new Map, this.Uo = Ni.ie(), this.onlineState = "Unknown" /* Unknown */ , 
+            this.Ko = new Map, this.jo = Ni.ie(), this.onlineState = "Unknown" /* Unknown */ , 
             // The primary state is set to `true` or `false` immediately after Firestore
             // startup. In the interim, a client should only be considered primary if
             // `isPrimary` is true.
-            this.qo = void 0;
+            this.Qo = void 0;
         }
         get isPrimaryClient() {
-            return !0 === this.qo;
+            return !0 === this.Qo;
         }
     }
 
@@ -10800,10 +12622,10 @@ var app = (function () {
      * server. All the subsequent view snapshots or errors are sent to the
      * subscribed handlers. Returns the initial snapshot.
      */
-    async function na(t, e) {
-        const n = Ca(t);
+    async function nc(t, e) {
+        const n = Cc(t);
         let s, i;
-        const r = n.xo.get(e);
+        const r = n.Oo.get(e);
         if (r) 
         // PORTING NOTE: With Multi-Tab Web, it is possible that a query view
         // already exists when EventManager calls us for the first time. This
@@ -10811,9 +12633,9 @@ var app = (function () {
         // behalf of another tab and the user of the primary also starts listening
         // to the query. EventManager will not have an assigned target ID in this
         // case and calls `listen` to obtain this ID.
-        s = r.targetId, n.sharedClientState.addLocalQueryTarget(s), i = r.view.Do(); else {
+        s = r.targetId, n.sharedClientState.addLocalQueryTarget(s), i = r.view.xo(); else {
             const t = await mr(n.localStore, Ee(e)), r = n.sharedClientState.addLocalQueryTarget(t.targetId);
-            s = t.targetId, i = await sa(n, e, s, "current" === r), n.isPrimaryClient && ao(n.remoteStore, t);
+            s = t.targetId, i = await sc(n, e, s, "current" === r), n.isPrimaryClient && co(n.remoteStore, t);
         }
         return i;
     }
@@ -10821,33 +12643,33 @@ var app = (function () {
     /**
      * Registers a view for a previously unknown query and computes its initial
      * snapshot.
-     */ async function sa(t, e, n, s) {
+     */ async function sc(t, e, n, s) {
         // PORTING NOTE: On Web only, we inject the code that registers new Limbo
         // targets based on view changes. This allows us to only depend on Limbo
         // changes when user code includes queries.
-        t.Ko = (e, n, s) => async function(t, e, n, s) {
-            let i = e.view.Io(n);
+        t.Wo = (e, n, s) => async function(t, e, n, s) {
+            let i = e.view.bo(n);
             i.Ln && (
             // The query has a limit and some docs were removed, so we need
             // to re-run the query against the local store to make sure we
             // didn't lose any good docs that had been past the limit.
             i = await yr(t.localStore, e.query, 
-            /* usePreviousResults= */ !1).then((({documents: t}) => e.view.Io(t, i))));
+            /* usePreviousResults= */ !1).then((({documents: t}) => e.view.bo(t, i))));
             const r = s && s.targetChanges.get(e.targetId), o = e.view.applyChanges(i, 
             /* updateLimboDocuments= */ t.isPrimaryClient, r);
-            return ma(t, e.targetId, o.vo), o.snapshot;
+            return mc(t, e.targetId, o.Do), o.snapshot;
         }(t, e, n, s);
         const i = await yr(t.localStore, e, 
-        /* usePreviousResults= */ !0), r = new Xo(e, i.Gn), o = r.Io(i.documents), a = Dn.createSynthesizedTargetChangeForCurrentChange(n, s && "Offline" /* Offline */ !== t.onlineState), c = r.applyChanges(o, 
-        /* updateLimboDocuments= */ t.isPrimaryClient, a);
-        ma(t, n, c.vo);
+        /* usePreviousResults= */ !0), r = new Xo(e, i.Gn), o = r.bo(i.documents), c = Dn.createSynthesizedTargetChangeForCurrentChange(n, s && "Offline" /* Offline */ !== t.onlineState), a = r.applyChanges(o, 
+        /* updateLimboDocuments= */ t.isPrimaryClient, c);
+        mc(t, n, a.Do);
         const u = new Zo(e, n, r);
-        return t.xo.set(e, u), t.ko.has(n) ? t.ko.get(n).push(e) : t.ko.set(n, [ e ]), c.snapshot;
+        return t.Oo.set(e, u), t.Fo.has(n) ? t.Fo.get(n).push(e) : t.Fo.set(n, [ e ]), a.snapshot;
     }
 
-    /** Stops listening to the query. */ async function ia(t, e) {
-        const n = q(t), s = n.xo.get(e), i = n.ko.get(s.targetId);
-        if (i.length > 1) return n.ko.set(s.targetId, i.filter((t => !Ae(t, e)))), void n.xo.delete(e);
+    /** Stops listening to the query. */ async function ic(t, e) {
+        const n = q(t), s = n.Oo.get(e), i = n.Fo.get(s.targetId);
+        if (i.length > 1) return n.Fo.set(s.targetId, i.filter((t => !Ae(t, e)))), void n.Oo.delete(e);
         // No other queries are mapped to the target, clean up the query and the target.
             if (n.isPrimaryClient) {
             // We need to remove the local query target first to allow us to verify
@@ -10855,10 +12677,10 @@ var app = (function () {
             n.sharedClientState.removeLocalQueryTarget(s.targetId);
             n.sharedClientState.isActiveQueryTarget(s.targetId) || await gr(n.localStore, s.targetId, 
             /*keepPersistedTargetData=*/ !1).then((() => {
-                n.sharedClientState.clearQueryState(s.targetId), co(n.remoteStore, s.targetId), 
-                wa(n, s.targetId);
+                n.sharedClientState.clearQueryState(s.targetId), ao(n.remoteStore, s.targetId), 
+                wc(n, s.targetId);
             })).catch(Fi);
-        } else wa(n, s.targetId), await gr(n.localStore, s.targetId, 
+        } else wc(n, s.targetId), await gr(n.localStore, s.targetId, 
         /*keepPersistedTargetData=*/ !0);
     }
 
@@ -10871,8 +12693,8 @@ var app = (function () {
      * have completed, *not* when the write was acked by the backend. The
      * userCallback is resolved once the write was acked/rejected by the
      * backend (or failed locally for any other reason).
-     */ async function ra(t, e, n) {
-        const s = Na(t);
+     */ async function rc(t, e, n) {
+        const s = Nc(t);
         try {
             const t = await function(t, e) {
                 const n = q(t), s = it.now(), i = e.reduce(((t, e) => t.add(e.key)), Pn());
@@ -10900,14 +12722,14 @@ var app = (function () {
                 })));
             }(s.localStore, e);
             s.sharedClientState.addPendingMutation(t.batchId), function(t, e, n) {
-                let s = t.Lo[t.currentUser.toKey()];
+                let s = t.qo[t.currentUser.toKey()];
                 s || (s = new wn(et));
-                s = s.insert(e, n), t.Lo[t.currentUser.toKey()] = s;
+                s = s.insert(e, n), t.qo[t.currentUser.toKey()] = s;
             }
             /**
      * Resolves or rejects the user callback for the given batch and then discards
      * it.
-     */ (s, t.batchId, n), await pa(s, t.changes), await Eo(s.remoteStore);
+     */ (s, t.batchId, n), await pc(s, t.changes), await Eo(s.remoteStore);
         } catch (t) {
             // If we can't persist the mutation, we reject the user callback and
             // don't send the mutation. The user can then retry the write.
@@ -10920,20 +12742,20 @@ var app = (function () {
      * Applies one remote event to the sync engine, notifying any views of the
      * changes, and releasing any pending mutation batches that would become
      * visible because of the snapshot version the remote event contains.
-     */ async function oa(t, e) {
+     */ async function oc(t, e) {
         const n = q(t);
         try {
             const t = await dr(n.localStore, e);
             // Update `receivedDocument` as appropriate for any limbo targets.
                     e.targetChanges.forEach(((t, e) => {
-                const s = n.Fo.get(e);
+                const s = n.Bo.get(e);
                 s && (
                 // Since this is a limbo resolution lookup, it's for a single document
                 // and it could be added, modified, or removed, but not a combination.
                 B(t.addedDocuments.size + t.modifiedDocuments.size + t.removedDocuments.size <= 1), 
-                t.addedDocuments.size > 0 ? s.Co = !0 : t.modifiedDocuments.size > 0 ? B(s.Co) : t.removedDocuments.size > 0 && (B(s.Co), 
-                s.Co = !1));
-            })), await pa(n, t, e);
+                t.addedDocuments.size > 0 ? s.ko = !0 : t.modifiedDocuments.size > 0 ? B(s.ko) : t.removedDocuments.size > 0 && (B(s.ko), 
+                s.ko = !1));
+            })), await pc(n, t, e);
         } catch (t) {
             await Fi(t);
         }
@@ -10942,7 +12764,7 @@ var app = (function () {
     /**
      * Applies an OnlineState change to the sync engine and notifies any views of
      * the change.
-     */ function aa(t, e, n) {
+     */ function cc(t, e, n) {
         const s = q(t);
         // If we are the secondary client, we explicitly ignore the remote store's
         // online state (the local client may go offline, even though the primary
@@ -10950,8 +12772,8 @@ var app = (function () {
         // SharedClientState.
             if (s.isPrimaryClient && 0 /* RemoteStore */ === n || !s.isPrimaryClient && 1 /* SharedClientState */ === n) {
             const t = [];
-            s.xo.forEach(((n, s) => {
-                const i = s.view.eo(e);
+            s.Oo.forEach(((n, s) => {
+                const i = s.view.io(e);
                 i.snapshot && t.push(i.snapshot);
             })), function(t, e) {
                 const n = q(t);
@@ -10960,9 +12782,9 @@ var app = (function () {
                 n.queries.forEach(((t, n) => {
                     for (const t of n.listeners) 
                     // Run global snapshot listeners if a consistent snapshot has been emitted.
-                    t.eo(e) && (s = !0);
+                    t.io(e) && (s = !0);
                 })), s && jo(n);
-            }(s.eventManager, e), t.length && s.No.Er(t), s.onlineState = e, s.isPrimaryClient && s.sharedClientState.setOnlineState(e);
+            }(s.eventManager, e), t.length && s.$o.Rr(t), s.onlineState = e, s.isPrimaryClient && s.sharedClientState.setOnlineState(e);
         }
     }
 
@@ -10976,11 +12798,11 @@ var app = (function () {
      * @param err - A description of the condition that has forced the rejection.
      * Nearly always this will be an indication that the user is no longer
      * authorized to see the data matching the target.
-     */ async function ca(t, e, n) {
+     */ async function ac(t, e, n) {
         const s = q(t);
         // PORTING NOTE: Multi-tab only.
             s.sharedClientState.updateQueryState(e, "rejected", n);
-        const i = s.Fo.get(e), r = i && i.key;
+        const i = s.Bo.get(e), r = i && i.key;
         if (r) {
             // TODO(klimt): We really only should do the following on permission
             // denied errors, but we don't have the cause code here.
@@ -10993,18 +12815,18 @@ var app = (function () {
             const n = Pn().add(r), i = new Sn(rt.min(), 
             /* targetChanges= */ new Map, 
             /* targetMismatches= */ new gn(et), t, n);
-            await oa(s, i), 
+            await oc(s, i), 
             // Since this query failed, we won't want to manually unlisten to it.
             // We only remove it from bookkeeping after we successfully applied the
             // RemoteEvent. If `applyRemoteEvent()` throws, we want to re-listen to
             // this query when the RemoteStore restarts the Watch stream, which should
             // re-trigger the target failure.
-            s.Oo = s.Oo.remove(r), s.Fo.delete(e), ya(s);
+            s.Lo = s.Lo.remove(r), s.Bo.delete(e), yc(s);
         } else await gr(s.localStore, e, 
-        /* keepPersistedTargetData */ !1).then((() => wa(s, e, n))).catch(Fi);
+        /* keepPersistedTargetData */ !1).then((() => wc(s, e, n))).catch(Fi);
     }
 
-    async function ua(t, e) {
+    async function uc(t, e) {
         const n = q(t), s = e.batch.batchId;
         try {
             const t = await lr(n.localStore, e);
@@ -11012,14 +12834,14 @@ var app = (function () {
             // raise events immediately (depending on whether the watcher is caught
             // up), so we raise user callbacks first so that they consistently happen
             // before listen events.
-                    da(n, s, /*error=*/ null), fa(n, s), n.sharedClientState.updateMutationState(s, "acknowledged"), 
-            await pa(n, t);
+                    dc(n, s, /*error=*/ null), fc(n, s), n.sharedClientState.updateMutationState(s, "acknowledged"), 
+            await pc(n, t);
         } catch (t) {
             await Fi(t);
         }
     }
 
-    async function ha(t, e, n) {
+    async function hc(t, e, n) {
         const s = q(t);
         try {
             const t = await function(t, e) {
@@ -11039,8 +12861,8 @@ var app = (function () {
             // raise events immediately (depending on whether the watcher is caught up),
             // so we raise user callbacks first so that they consistently happen before
             // listen events.
-                    da(s, e, n), fa(s, e), s.sharedClientState.updateMutationState(e, "rejected", n), 
-            await pa(s, t);
+                    dc(s, e, n), fc(s, e), s.sharedClientState.updateMutationState(e, "rejected", n), 
+            await pc(s, t);
         } catch (n) {
             await Fi(n);
         }
@@ -11049,56 +12871,56 @@ var app = (function () {
     /**
      * Triggers the callbacks that are waiting for this batch id to get acknowledged by server,
      * if there are any.
-     */ function fa(t, e) {
-        (t.Bo.get(e) || []).forEach((t => {
+     */ function fc(t, e) {
+        (t.Ko.get(e) || []).forEach((t => {
             t.resolve();
-        })), t.Bo.delete(e);
+        })), t.Ko.delete(e);
     }
 
-    /** Reject all outstanding callbacks waiting for pending writes to complete. */ function da(t, e, n) {
+    /** Reject all outstanding callbacks waiting for pending writes to complete. */ function dc(t, e, n) {
         const s = q(t);
-        let i = s.Lo[s.currentUser.toKey()];
+        let i = s.qo[s.currentUser.toKey()];
         // NOTE: Mutations restored from persistence won't have callbacks, so it's
         // okay for there to be no callback for this ID.
             if (i) {
             const t = i.get(e);
-            t && (n ? t.reject(n) : t.resolve(), i = i.remove(e)), s.Lo[s.currentUser.toKey()] = i;
+            t && (n ? t.reject(n) : t.resolve(), i = i.remove(e)), s.qo[s.currentUser.toKey()] = i;
         }
     }
 
-    function wa(t, e, n = null) {
+    function wc(t, e, n = null) {
         t.sharedClientState.removeLocalQueryTarget(e);
-        for (const s of t.ko.get(e)) t.xo.delete(s), n && t.No.jo(s, n);
-        if (t.ko.delete(e), t.isPrimaryClient) {
-            t.Mo.cs(e).forEach((e => {
-                t.Mo.containsKey(e) || 
+        for (const s of t.Fo.get(e)) t.Oo.delete(s), n && t.$o.Go(s, n);
+        if (t.Fo.delete(e), t.isPrimaryClient) {
+            t.Uo.cs(e).forEach((e => {
+                t.Uo.containsKey(e) || 
                 // We removed the last reference for this key
-                _a(t, e);
+                _c(t, e);
             }));
         }
     }
 
-    function _a(t, e) {
-        t.$o.delete(e.path.canonicalString());
+    function _c(t, e) {
+        t.Mo.delete(e.path.canonicalString());
         // It's possible that the target already got removed because the query failed. In that case,
         // the key won't exist in `limboTargetsByKey`. Only do the cleanup if we still have the target.
-        const n = t.Oo.get(e);
-        null !== n && (co(t.remoteStore, n), t.Oo = t.Oo.remove(e), t.Fo.delete(n), ya(t));
+        const n = t.Lo.get(e);
+        null !== n && (ao(t.remoteStore, n), t.Lo = t.Lo.remove(e), t.Bo.delete(n), yc(t));
     }
 
-    function ma(t, e, n) {
-        for (const s of n) if (s instanceof Jo) t.Mo.addReference(s.key, e), ga(t, s); else if (s instanceof Yo) {
-            $("SyncEngine", "Document no longer in limbo: " + s.key), t.Mo.removeReference(s.key, e);
-            t.Mo.containsKey(s.key) || 
+    function mc(t, e, n) {
+        for (const s of n) if (s instanceof Jo) t.Uo.addReference(s.key, e), gc(t, s); else if (s instanceof Yo) {
+            $("SyncEngine", "Document no longer in limbo: " + s.key), t.Uo.removeReference(s.key, e);
+            t.Uo.containsKey(s.key) || 
             // We removed the last reference for this key
-            _a(t, s.key);
+            _c(t, s.key);
         } else L();
     }
 
-    function ga(t, e) {
+    function gc(t, e) {
         const n = e.key, s = n.path.canonicalString();
-        t.Oo.get(n) || t.$o.has(s) || ($("SyncEngine", "New document in limbo: " + n), t.$o.add(s), 
-        ya(t));
+        t.Lo.get(n) || t.Mo.has(s) || ($("SyncEngine", "New document in limbo: " + n), t.Mo.add(s), 
+        yc(t));
     }
 
     /**
@@ -11108,27 +12930,27 @@ var app = (function () {
      * Without bounding the number of concurrent resolutions, the server can fail
      * with "resource exhausted" errors which can lead to pathological client
      * behavior as seen in https://github.com/firebase/firebase-js-sdk/issues/2683.
-     */ function ya(t) {
-        for (;t.$o.size > 0 && t.Oo.size < t.maxConcurrentLimboResolutions; ) {
-            const e = t.$o.values().next().value;
-            t.$o.delete(e);
-            const n = new Pt(ht.fromString(e)), s = t.Uo.next();
-            t.Fo.set(s, new ta(n)), t.Oo = t.Oo.insert(n, s), ao(t.remoteStore, new ii(Ee(we(n.path)), s, 2 /* LimboResolution */ , X.T));
+     */ function yc(t) {
+        for (;t.Mo.size > 0 && t.Lo.size < t.maxConcurrentLimboResolutions; ) {
+            const e = t.Mo.values().next().value;
+            t.Mo.delete(e);
+            const n = new Pt(ht.fromString(e)), s = t.jo.next();
+            t.Bo.set(s, new tc(n)), t.Lo = t.Lo.insert(n, s), co(t.remoteStore, new ii(Ee(we(n.path)), s, 2 /* LimboResolution */ , X.T));
         }
     }
 
-    async function pa(t, e, n) {
+    async function pc(t, e, n) {
         const s = q(t), i = [], r = [], o = [];
-        s.xo.isEmpty() || (s.xo.forEach(((t, a) => {
-            o.push(s.Ko(a, e, n).then((t => {
+        s.Oo.isEmpty() || (s.Oo.forEach(((t, c) => {
+            o.push(s.Wo(c, e, n).then((t => {
                 if (t) {
-                    s.isPrimaryClient && s.sharedClientState.updateQueryState(a.targetId, t.fromCache ? "not-current" : "current"), 
+                    s.isPrimaryClient && s.sharedClientState.updateQueryState(c.targetId, t.fromCache ? "not-current" : "current"), 
                     i.push(t);
-                    const e = or.kn(a.targetId, t);
+                    const e = or.kn(c.targetId, t);
                     r.push(e);
                 }
             })));
-        })), await Promise.all(o), s.No.Er(i), await async function(t, e) {
+        })), await Promise.all(o), s.$o.Rr(i), await async function(t, e) {
             const n = q(t);
             try {
                 await n.persistence.runTransaction("notifyLocalViewChanges", "readwrite", (t => js.forEach(e, (e => js.forEach(e.Nn, (s => n.persistence.referenceDelegate.addReference(t, e.targetId, s))).next((() => js.forEach(e.xn, (s => n.persistence.referenceDelegate.removeReference(t, e.targetId, s)))))))));
@@ -11151,7 +12973,7 @@ var app = (function () {
         }(s.localStore, r));
     }
 
-    async function Ta(t, e) {
+    async function Tc(t, e) {
         const n = q(t);
         if (!n.currentUser.isEqual(e)) {
             $("SyncEngine", "User change. New user:", e.toKey());
@@ -11159,63 +12981,63 @@ var app = (function () {
             n.currentUser = e, 
             // Fails tasks waiting for pending writes requested by previous user.
             function(t, e) {
-                t.Bo.forEach((t => {
+                t.Ko.forEach((t => {
                     t.forEach((t => {
                         t.reject(new j(K.CANCELLED, e));
                     }));
-                })), t.Bo.clear();
+                })), t.Ko.clear();
             }(n, "'waitForPendingWrites' promise is rejected due to a user change."), 
             // TODO(b/114226417): Consider calling this only in the primary tab.
-            n.sharedClientState.handleUserChange(e, t.removedBatchIds, t.addedBatchIds), await pa(n, t.Wn);
+            n.sharedClientState.handleUserChange(e, t.removedBatchIds, t.addedBatchIds), await pc(n, t.Wn);
         }
     }
 
-    function Ea(t, e) {
-        const n = q(t), s = n.Fo.get(e);
-        if (s && s.Co) return Pn().add(s.key);
+    function Ec(t, e) {
+        const n = q(t), s = n.Bo.get(e);
+        if (s && s.ko) return Pn().add(s.key);
         {
             let t = Pn();
-            const s = n.ko.get(e);
+            const s = n.Fo.get(e);
             if (!s) return t;
             for (const e of s) {
-                const s = n.xo.get(e);
-                t = t.unionWith(s.view.Eo);
+                const s = n.Oo.get(e);
+                t = t.unionWith(s.view.Ro);
             }
             return t;
         }
     }
 
-    function Ca(t) {
+    function Cc(t) {
         const e = q(t);
-        return e.remoteStore.remoteSyncer.applyRemoteEvent = oa.bind(null, e), e.remoteStore.remoteSyncer.getRemoteKeysForTarget = Ea.bind(null, e), 
-        e.remoteStore.remoteSyncer.rejectListen = ca.bind(null, e), e.No.Er = qo.bind(null, e.eventManager), 
-        e.No.jo = Ko.bind(null, e.eventManager), e;
+        return e.remoteStore.remoteSyncer.applyRemoteEvent = oc.bind(null, e), e.remoteStore.remoteSyncer.getRemoteKeysForTarget = Ec.bind(null, e), 
+        e.remoteStore.remoteSyncer.rejectListen = ac.bind(null, e), e.$o.Rr = qo.bind(null, e.eventManager), 
+        e.$o.Go = Ko.bind(null, e.eventManager), e;
     }
 
-    function Na(t) {
+    function Nc(t) {
         const e = q(t);
-        return e.remoteStore.remoteSyncer.applySuccessfulWrite = ua.bind(null, e), e.remoteStore.remoteSyncer.rejectFailedWrite = ha.bind(null, e), 
+        return e.remoteStore.remoteSyncer.applySuccessfulWrite = uc.bind(null, e), e.remoteStore.remoteSyncer.rejectFailedWrite = hc.bind(null, e), 
         e;
     }
 
-    class ka {
+    class kc {
         constructor() {
             this.synchronizeTabs = !1;
         }
         async initialize(t) {
-            this.N = Yr(t.databaseInfo.databaseId), this.sharedClientState = this.Wo(t), this.persistence = this.Go(t), 
-            await this.persistence.start(), this.gcScheduler = this.zo(t), this.localStore = this.Ho(t);
+            this.N = Yr(t.databaseInfo.databaseId), this.sharedClientState = this.Ho(t), this.persistence = this.Jo(t), 
+            await this.persistence.start(), this.gcScheduler = this.Yo(t), this.localStore = this.Xo(t);
         }
-        zo(t) {
+        Yo(t) {
             return null;
         }
-        Ho(t) {
-            return ur(this.persistence, new ar, t.initialUser, this.N);
+        Xo(t) {
+            return ur(this.persistence, new cr, t.initialUser, this.N);
         }
-        Go(t) {
+        Jo(t) {
             return new Cr(xr.Ns, this.N);
         }
-        Wo(t) {
+        Ho(t) {
             return new Kr;
         }
         async terminate() {
@@ -11227,13 +13049,13 @@ var app = (function () {
     /**
      * Initializes and wires the components that are needed to interface with the
      * network.
-     */ class Fa {
+     */ class Fc {
         async initialize(t, e) {
             this.localStore || (this.localStore = t.localStore, this.sharedClientState = t.sharedClientState, 
             this.datastore = this.createDatastore(e), this.remoteStore = this.createRemoteStore(e), 
             this.eventManager = this.createEventManager(e), this.syncEngine = this.createSyncEngine(e, 
-            /* startAsPrimary=*/ !t.synchronizeTabs), this.sharedClientState.onlineStateHandler = t => aa(this.syncEngine, t, 1 /* SharedClientState */), 
-            this.remoteStore.remoteSyncer.handleCredentialChange = Ta.bind(null, this.syncEngine), 
+            /* startAsPrimary=*/ !t.synchronizeTabs), this.sharedClientState.onlineStateHandler = t => cc(this.syncEngine, t, 1 /* SharedClientState */), 
+            this.remoteStore.remoteSyncer.handleCredentialChange = Tc.bind(null, this.syncEngine), 
             await Do(this.remoteStore, this.syncEngine.isPrimaryClient));
         }
         createEventManager(t) {
@@ -11247,7 +13069,7 @@ var app = (function () {
             }(t.credentials, n, e);
         }
         createRemoteStore(t) {
-            return e = this.localStore, n = this.datastore, s = t.asyncQueue, i = t => aa(this.syncEngine, t, 0 /* RemoteStore */), 
+            return e = this.localStore, n = this.datastore, s = t.asyncQueue, i = t => cc(this.syncEngine, t, 0 /* RemoteStore */), 
             r = Qr.bt() ? new Qr : new jr, new io(e, n, s, i, r);
             var e, n, s, i, r;
             /** Re-enables the network. Idempotent. */    }
@@ -11255,18 +13077,18 @@ var app = (function () {
             return function(t, e, n, 
             // PORTING NOTE: Manages state synchronization in multi-tab environments.
             s, i, r, o) {
-                const a = new ea(t, e, n, s, i, r);
-                return o && (a.qo = !0), a;
+                const c = new ec(t, e, n, s, i, r);
+                return o && (c.Qo = !0), c;
             }(this.localStore, this.remoteStore, this.eventManager, this.sharedClientState, t.initialUser, t.maxConcurrentLimboResolutions, e);
         }
         terminate() {
             return async function(t) {
                 const e = q(t);
-                $("RemoteStore", "RemoteStore shutting down."), e.Kr.add(5 /* Shutdown */), await oo(e), 
-                e.Qr.shutdown(), 
+                $("RemoteStore", "RemoteStore shutting down."), e.Wr.add(5 /* Shutdown */), await oo(e), 
+                e.zr.shutdown(), 
                 // Set the OnlineState to Unknown (rather than Offline) to avoid potentially
                 // triggering spurious listener events with cached data, etc.
-                e.Wr.set("Unknown" /* Unknown */);
+                e.Hr.set("Unknown" /* Unknown */);
             }(this.remoteStore);
         }
     }
@@ -11311,7 +13133,7 @@ var app = (function () {
      * asynchronously. To allow immediate silencing, a mute call is added which
      * causes events scheduled to no longer be raised.
      */
-    class La {
+    class Lc {
         constructor(t) {
             this.observer = t, 
             /**
@@ -11321,15 +13143,15 @@ var app = (function () {
             this.muted = !1;
         }
         next(t) {
-            this.observer.next && this.Yo(this.observer.next, t);
+            this.observer.next && this.tc(this.observer.next, t);
         }
         error(t) {
-            this.observer.error ? this.Yo(this.observer.error, t) : console.error("Uncaught Error in snapshot listener:", t);
+            this.observer.error ? this.tc(this.observer.error, t) : console.error("Uncaught Error in snapshot listener:", t);
         }
-        Xo() {
+        ec() {
             this.muted = !0;
         }
-        Yo(t, e) {
+        tc(t, e) {
             this.muted || setTimeout((() => {
                 this.muted || t(e);
             }), 0);
@@ -11357,7 +13179,7 @@ var app = (function () {
      * pieces of the client SDK architecture. It is responsible for creating the
      * async queue that is shared by all of the other components in the system.
      */
-    class Ka {
+    class Kc {
         constructor(t, 
         /**
          * Asynchronous queue responsible for all of our internal processing. When
@@ -11411,7 +13233,7 @@ var app = (function () {
         }
     }
 
-    async function ja(t, e) {
+    async function jc(t, e) {
         t.asyncQueue.verifyOperationInProgress(), $("FirestoreClient", "Initializing OfflineComponentProvider");
         const n = await t.getConfiguration();
         await e.initialize(n);
@@ -11424,9 +13246,9 @@ var app = (function () {
         e.persistence.setDatabaseDeletedListener((() => t.terminate())), t.offlineComponents = e;
     }
 
-    async function Qa(t, e) {
+    async function Qc(t, e) {
         t.asyncQueue.verifyOperationInProgress();
-        const n = await Wa(t);
+        const n = await Wc(t);
         $("FirestoreClient", "Initializing OnlineComponentProvider");
         const s = await t.getConfiguration();
         await e.initialize(n, s), 
@@ -11439,37 +13261,37 @@ var app = (function () {
             // Tear down and re-create our network streams. This will ensure we get a
             // fresh auth token for the new user and re-fill the write pipeline with
             // new mutations from the LocalStore (since mutations are per-user).
-                    n.Kr.add(3 /* CredentialChange */), await oo(n), s && 
+                    n.Wr.add(3 /* CredentialChange */), await oo(n), s && 
             // Don't set the network status to Unknown if we are offline.
-            n.Wr.set("Unknown" /* Unknown */), await n.remoteSyncer.handleCredentialChange(e), 
-            n.Kr.delete(3 /* CredentialChange */), await ro(n);
+            n.Hr.set("Unknown" /* Unknown */), await n.remoteSyncer.handleCredentialChange(e), 
+            n.Wr.delete(3 /* CredentialChange */), await ro(n);
         }(e.remoteStore, t))), t.onlineComponents = e;
     }
 
-    async function Wa(t) {
+    async function Wc(t) {
         return t.offlineComponents || ($("FirestoreClient", "Using default OfflineComponentProvider"), 
-        await ja(t, new ka)), t.offlineComponents;
+        await jc(t, new kc)), t.offlineComponents;
     }
 
-    async function Ga(t) {
+    async function Gc(t) {
         return t.onlineComponents || ($("FirestoreClient", "Using default OnlineComponentProvider"), 
-        await Qa(t, new Fa)), t.onlineComponents;
+        await Qc(t, new Fc)), t.onlineComponents;
     }
 
-    function Ya(t) {
-        return Ga(t).then((t => t.syncEngine));
+    function Yc(t) {
+        return Gc(t).then((t => t.syncEngine));
     }
 
-    async function Xa(t) {
-        const e = await Ga(t), n = e.eventManager;
-        return n.onListen = na.bind(null, e.syncEngine), n.onUnlisten = ia.bind(null, e.syncEngine), 
+    async function Xc(t) {
+        const e = await Gc(t), n = e.eventManager;
+        return n.onListen = nc.bind(null, e.syncEngine), n.onUnlisten = ic.bind(null, e.syncEngine), 
         n;
     }
 
-    function ic(t, e, n = {}) {
+    function ia(t, e, n = {}) {
         const s = new Q;
         return t.asyncQueue.enqueueAndForget((async () => function(t, e, n, s, i) {
-            const r = new La({
+            const r = new Lc({
                 next: n => {
                     // Remove query first before passing event to user to avoid
                     // user actions affecting the now stale query.
@@ -11478,13 +13300,13 @@ var app = (function () {
                 error: t => i.reject(t)
             }), o = new Qo(n, r, {
                 includeMetadataChanges: !0,
-                uo: !0
+                fo: !0
             });
             return Bo(t, o);
-        }(await Xa(t), t.asyncQueue, e, n, s))), s.promise;
+        }(await Xc(t), t.asyncQueue, e, n, s))), s.promise;
     }
 
-    class uc {
+    class ua {
         /**
          * Constructs a DatabaseInfo using the provided host, databaseId and
          * persistenceKey.
@@ -11502,9 +13324,9 @@ var app = (function () {
          * @param useFetchStreams Whether to use the Fetch API instead of
          * XMLHTTPRequest
          */
-        constructor(t, e, n, s, i, r, o, a) {
+        constructor(t, e, n, s, i, r, o, c) {
             this.databaseId = t, this.appId = e, this.persistenceKey = n, this.host = s, this.ssl = i, 
-            this.forceLongPolling = r, this.autoDetectLongPolling = o, this.useFetchStreams = a;
+            this.forceLongPolling = r, this.autoDetectLongPolling = o, this.useFetchStreams = c;
         }
     }
 
@@ -11513,7 +13335,7 @@ var app = (function () {
      * Represents the database ID a Firestore client is associated with.
      * @internal
      */
-    class hc {
+    class ha {
         constructor(t, e) {
             this.projectId = t, this.database = e || "(default)";
         }
@@ -11521,7 +13343,7 @@ var app = (function () {
             return "(default)" === this.database;
         }
         isEqual(t) {
-            return t instanceof hc && t.projectId === this.projectId && t.database === this.database;
+            return t instanceof ha && t.projectId === this.projectId && t.database === this.database;
         }
     }
 
@@ -11540,7 +13362,7 @@ var app = (function () {
      * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
      * See the License for the specific language governing permissions and
      * limitations under the License.
-     */ const lc = new Map;
+     */ const la = new Map;
 
     /**
      * An instance map that ensures only one Datastore exists per Firestore
@@ -11562,28 +13384,28 @@ var app = (function () {
      * See the License for the specific language governing permissions and
      * limitations under the License.
      */
-    function fc(t, e, n) {
+    function fa(t, e, n) {
         if (!n) throw new j(K.INVALID_ARGUMENT, `Function ${t}() cannot be called with an empty ${e}.`);
     }
 
     /**
      * Validates that two boolean options are not set at the same time.
      * @internal
-     */ function dc(t, e, n, s) {
+     */ function da(t, e, n, s) {
         if (!0 === e && !0 === s) throw new j(K.INVALID_ARGUMENT, `${t} and ${n} cannot be used together.`);
     }
 
     /**
      * Validates that `path` refers to a document (indicated by the fact it contains
      * an even numbers of segments).
-     */ function wc(t) {
+     */ function wa(t) {
         if (!Pt.isDocumentKey(t)) throw new j(K.INVALID_ARGUMENT, `Invalid document reference. Document references must have an even number of segments, but ${t} has ${t.length}.`);
     }
 
     /**
      * Validates that `path` refers to a collection (indicated by the fact it
      * contains an odd numbers of segments).
-     */ function _c(t) {
+     */ function _a(t) {
         if (Pt.isDocumentKey(t)) throw new j(K.INVALID_ARGUMENT, `Invalid collection reference. Collection references must have an odd number of segments, but ${t} has ${t.length}.`);
     }
 
@@ -11592,7 +13414,7 @@ var app = (function () {
      * (i.e. excludes Array, Date, etc.).
      */
     /** Returns a string describing the type / value of the provided input. */
-    function mc(t) {
+    function ma(t) {
         if (void 0 === t) return "undefined";
         if (null === t) return "null";
         if ("string" == typeof t) return t.length > 20 && (t = `${t.substring(0, 20)}...`), 
@@ -11621,7 +13443,7 @@ var app = (function () {
         return "function" == typeof t ? "a function" : L();
     }
 
-    function gc(t, 
+    function ga(t, 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     e) {
         if ("_delegate" in t && (
@@ -11630,7 +13452,7 @@ var app = (function () {
         t = t._delegate), !(t instanceof e)) {
             if (e.name === t.constructor.name) throw new j(K.INVALID_ARGUMENT, "Type does not match the expected instance. Did you pass a reference from a different Firestore SDK?");
             {
-                const n = mc(t);
+                const n = ma(t);
                 throw new j(K.INVALID_ARGUMENT, `Expected type '${e.name}', but it was: ${n}`);
             }
         }
@@ -11659,7 +13481,7 @@ var app = (function () {
      * user-supplied `FirestoreSettings` object. This is a separate type so that
      * defaults can be supplied and the value can be checked for equality.
      */
-    class pc {
+    class pa {
         constructor(t) {
             var e;
             if (void 0 === t.host) {
@@ -11672,7 +13494,7 @@ var app = (function () {
                 this.cacheSizeBytes = t.cacheSizeBytes;
             }
             this.experimentalForceLongPolling = !!t.experimentalForceLongPolling, this.experimentalAutoDetectLongPolling = !!t.experimentalAutoDetectLongPolling, 
-            this.useFetchStreams = !!t.useFetchStreams, dc("experimentalForceLongPolling", t.experimentalForceLongPolling, "experimentalAutoDetectLongPolling", t.experimentalAutoDetectLongPolling);
+            this.useFetchStreams = !!t.useFetchStreams, da("experimentalForceLongPolling", t.experimentalForceLongPolling, "experimentalAutoDetectLongPolling", t.experimentalAutoDetectLongPolling);
         }
         isEqual(t) {
             return this.host === t.host && this.ssl === t.ssl && this.credentials === t.credentials && this.cacheSizeBytes === t.cacheSizeBytes && this.experimentalForceLongPolling === t.experimentalForceLongPolling && this.experimentalAutoDetectLongPolling === t.experimentalAutoDetectLongPolling && this.ignoreUndefinedProperties === t.ignoreUndefinedProperties && this.useFetchStreams === t.useFetchStreams;
@@ -11699,18 +13521,18 @@ var app = (function () {
      * The Cloud Firestore service interface.
      *
      * Do not call this constructor directly. Instead, use {@link getFirestore}.
-     */ class Tc {
+     */ class Ta {
         /** @hideconstructor */
         constructor(t, e) {
             this._credentials = e, 
             /**
              * Whether it's a Firestore or Firestore Lite instance.
              */
-            this.type = "firestore-lite", this._persistenceKey = "(lite)", this._settings = new pc({}), 
-            this._settingsFrozen = !1, t instanceof hc ? this._databaseId = t : (this._app = t, 
+            this.type = "firestore-lite", this._persistenceKey = "(lite)", this._settings = new pa({}), 
+            this._settingsFrozen = !1, t instanceof ha ? this._databaseId = t : (this._app = t, 
             this._databaseId = function(t) {
                 if (!Object.prototype.hasOwnProperty.apply(t.options, [ "projectId" ])) throw new j(K.INVALID_ARGUMENT, '"projectId" not provided in firebase.initializeApp.');
-                return new hc(t.options.projectId);
+                return new ha(t.options.projectId);
             }
             /**
      * Modify this instance to communicate with the Cloud Firestore emulator.
@@ -11741,7 +13563,7 @@ var app = (function () {
         }
         _setSettings(t) {
             if (this._settingsFrozen) throw new j(K.FAILED_PRECONDITION, "Firestore has already been started and its settings can no longer be changed. You can only modify settings before calling any other methods on a Firestore object.");
-            this._settings = new pc(t), void 0 !== t.credentials && (this._credentials = function(t) {
+            this._settings = new pa(t), void 0 !== t.credentials && (this._credentials = function(t) {
                 if (!t) return new G;
                 switch (t.type) {
                   case "gapi":
@@ -11786,8 +13608,8 @@ var app = (function () {
      * when the `Firestore` instance is terminated.
      */
             return function(t) {
-                const e = lc.get(t);
-                e && ($("ComponentProvider", "Removing Datastore"), lc.delete(t), e.terminate());
+                const e = la.get(t);
+                e && ($("ComponentProvider", "Removing Datastore"), la.delete(t), e.terminate());
             }(this), Promise.resolve();
         }
     }
@@ -11812,7 +13634,7 @@ var app = (function () {
      * A `DocumentReference` refers to a document location in a Firestore database
      * and can be used to write, read, or listen to the location. The document at
      * the referenced location may or may not exist.
-     */ class Ic {
+     */ class Ia {
         /** @hideconstructor */
         constructor(t, 
         /**
@@ -11840,17 +13662,17 @@ var app = (function () {
         /**
          * The collection this `DocumentReference` belongs to.
          */    get parent() {
-            return new Rc(this.firestore, this.converter, this._key.path.popLast());
+            return new Ra(this.firestore, this.converter, this._key.path.popLast());
         }
         withConverter(t) {
-            return new Ic(this.firestore, t, this._key);
+            return new Ia(this.firestore, t, this._key);
         }
     }
 
     /**
      * A `Query` refers to a query which you can read or listen to. You can also
      * construct refined `Query` objects by adding filters and ordering.
-     */ class Ac {
+     */ class Aa {
         // This is the lite version of the Query class in the main SDK.
         /** @hideconstructor protected */
         constructor(t, 
@@ -11863,14 +13685,14 @@ var app = (function () {
             this.type = "query", this.firestore = t;
         }
         withConverter(t) {
-            return new Ac(this.firestore, t, this._query);
+            return new Aa(this.firestore, t, this._query);
         }
     }
 
     /**
      * A `CollectionReference` object can be used for adding documents, getting
      * document references, and querying for documents (using {@link query}).
-     */ class Rc extends Ac {
+     */ class Ra extends Aa {
         /** @hideconstructor */
         constructor(t, e, n) {
             super(t, e, we(n)), this._path = n, 
@@ -11891,40 +13713,40 @@ var app = (function () {
          * subcollection. If this isn't a subcollection, the reference is null.
          */    get parent() {
             const t = this._path.popLast();
-            return t.isEmpty() ? null : new Ic(this.firestore, 
+            return t.isEmpty() ? null : new Ia(this.firestore, 
             /* converter= */ null, new Pt(t));
         }
         withConverter(t) {
-            return new Rc(this.firestore, t, this._path);
+            return new Ra(this.firestore, t, this._path);
         }
     }
 
-    function bc(t, e, ...n) {
-        if (t = getModularInstance(t), fc("collection", "path", e), t instanceof Tc) {
+    function ba(t, e, ...n) {
+        if (t = getModularInstance(t), fa("collection", "path", e), t instanceof Ta) {
             const s = ht.fromString(e, ...n);
-            return _c(s), new Rc(t, /* converter= */ null, s);
+            return _a(s), new Ra(t, /* converter= */ null, s);
         }
         {
-            if (!(t instanceof Ic || t instanceof Rc)) throw new j(K.INVALID_ARGUMENT, "Expected first argument to collection() to be a CollectionReference, a DocumentReference or FirebaseFirestore");
+            if (!(t instanceof Ia || t instanceof Ra)) throw new j(K.INVALID_ARGUMENT, "Expected first argument to collection() to be a CollectionReference, a DocumentReference or FirebaseFirestore");
             const s = t._path.child(ht.fromString(e, ...n));
-            return _c(s), new Rc(t.firestore, 
+            return _a(s), new Ra(t.firestore, 
             /* converter= */ null, s);
         }
     }
 
-    function vc(t, e, ...n) {
+    function va(t, e, ...n) {
         if (t = getModularInstance(t), 
         // We allow omission of 'pathString' but explicitly prohibit passing in both
         // 'undefined' and 'null'.
-        1 === arguments.length && (e = tt.I()), fc("doc", "path", e), t instanceof Tc) {
+        1 === arguments.length && (e = tt.I()), fa("doc", "path", e), t instanceof Ta) {
             const s = ht.fromString(e, ...n);
-            return wc(s), new Ic(t, 
+            return wa(s), new Ia(t, 
             /* converter= */ null, new Pt(s));
         }
         {
-            if (!(t instanceof Ic || t instanceof Rc)) throw new j(K.INVALID_ARGUMENT, "Expected first argument to collection() to be a CollectionReference, a DocumentReference or FirebaseFirestore");
+            if (!(t instanceof Ia || t instanceof Ra)) throw new j(K.INVALID_ARGUMENT, "Expected first argument to collection() to be a CollectionReference, a DocumentReference or FirebaseFirestore");
             const s = t._path.child(ht.fromString(e, ...n));
-            return wc(s), new Ic(t.firestore, t instanceof Rc ? t.converter : null, new Pt(s));
+            return wa(s), new Ia(t.firestore, t instanceof Ra ? t.converter : null, new Pt(s));
         }
     }
 
@@ -11943,42 +13765,42 @@ var app = (function () {
      * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
      * See the License for the specific language governing permissions and
      * limitations under the License.
-     */ class Dc {
+     */ class Da {
         constructor() {
             // The last promise in the queue.
-            this.fa = Promise.resolve(), 
+            this._c = Promise.resolve(), 
             // A list of retryable operations. Retryable operations are run in order and
             // retried with backoff.
-            this.da = [], 
+            this.mc = [], 
             // Is this AsyncQueue being shut down? Once it is set to true, it will not
             // be changed again.
-            this.wa = !1, 
+            this.gc = !1, 
             // Operations scheduled to be queued in the future. Operations are
             // automatically removed after they are run or canceled.
-            this._a = [], 
+            this.yc = [], 
             // visible for testing
-            this.ma = null, 
+            this.Tc = null, 
             // Flag set while there's an outstanding AsyncQueue operation, used for
             // assertion sanity-checks.
-            this.ga = !1, 
+            this.Ec = !1, 
             // Enabled during shutdown on Safari to prevent future access to IndexedDB.
-            this.ya = !1, 
+            this.Ic = !1, 
             // List of TimerIds to fast-forward delays for.
-            this.pa = [], 
+            this.Ac = [], 
             // Backoff timer used to schedule retries for retryable operations
-            this.rr = new Xr(this, "async_queue_retry" /* AsyncQueueRetry */), 
+            this.ar = new Xr(this, "async_queue_retry" /* AsyncQueueRetry */), 
             // Visibility handler that triggers an immediate retry of all retryable
             // operations. Meant to speed up recovery when we regain file system access
             // after page comes into foreground.
-            this.Ta = () => {
+            this.Rc = () => {
                 const t = Jr();
-                t && $("AsyncQueue", "Visibility state changed to " + t.visibilityState), this.rr.tr();
+                t && $("AsyncQueue", "Visibility state changed to " + t.visibilityState), this.ar.tr();
             };
             const t = Jr();
-            t && "function" == typeof t.addEventListener && t.addEventListener("visibilitychange", this.Ta);
+            t && "function" == typeof t.addEventListener && t.addEventListener("visibilitychange", this.Rc);
         }
         get isShuttingDown() {
-            return this.wa;
+            return this.gc;
         }
         /**
          * Adds a new operation to the queue without waiting for it to complete (i.e.
@@ -11988,44 +13810,44 @@ var app = (function () {
             this.enqueue(t);
         }
         enqueueAndForgetEvenWhileRestricted(t) {
-            this.Ea(), 
+            this.bc(), 
             // eslint-disable-next-line @typescript-eslint/no-floating-promises
-            this.Ia(t);
+            this.Pc(t);
         }
         enterRestrictedMode(t) {
-            if (!this.wa) {
-                this.wa = !0, this.ya = t || !1;
+            if (!this.gc) {
+                this.gc = !0, this.Ic = t || !1;
                 const e = Jr();
-                e && "function" == typeof e.removeEventListener && e.removeEventListener("visibilitychange", this.Ta);
+                e && "function" == typeof e.removeEventListener && e.removeEventListener("visibilitychange", this.Rc);
             }
         }
         enqueue(t) {
-            if (this.Ea(), this.wa) 
+            if (this.bc(), this.gc) 
             // Return a Promise which never resolves.
             return new Promise((() => {}));
             // Create a deferred Promise that we can return to the callee. This
             // allows us to return a "hanging Promise" only to the callee and still
             // advance the queue even when the operation is not run.
                     const e = new Q;
-            return this.Ia((() => this.wa && this.ya ? Promise.resolve() : (t().then(e.resolve, e.reject), 
+            return this.Pc((() => this.gc && this.Ic ? Promise.resolve() : (t().then(e.resolve, e.reject), 
             e.promise))).then((() => e.promise));
         }
         enqueueRetryable(t) {
-            this.enqueueAndForget((() => (this.da.push(t), this.Aa())));
+            this.enqueueAndForget((() => (this.mc.push(t), this.vc())));
         }
         /**
          * Runs the next operation from the retryable queue. If the operation fails,
          * reschedules with backoff.
-         */    async Aa() {
-            if (0 !== this.da.length) {
+         */    async vc() {
+            if (0 !== this.mc.length) {
                 try {
-                    await this.da[0](), this.da.shift(), this.rr.reset();
+                    await this.mc[0](), this.mc.shift(), this.ar.reset();
                 } catch (t) {
                     if (!Hs(t)) throw t;
      // Failure will be handled by AsyncQueue
                                     $("AsyncQueue", "Operation failed with retryable error: " + t);
                 }
-                this.da.length > 0 && 
+                this.mc.length > 0 && 
                 // If there are additional operations, we re-schedule `retryNextOp()`.
                 // This is necessary to run retryable operations that failed during
                 // their initial attempt since we don't know whether they are already
@@ -12036,12 +13858,12 @@ var app = (function () {
                 // Since `backoffAndRun()` cancels an existing backoff and schedules a
                 // new backoff on every call, there is only ever a single additional
                 // operation in the queue.
-                this.rr.Xi((() => this.Aa()));
+                this.ar.Xi((() => this.vc()));
             }
         }
-        Ia(t) {
-            const e = this.fa.then((() => (this.ga = !0, t().catch((t => {
-                this.ma = t, this.ga = !1;
+        Pc(t) {
+            const e = this._c.then((() => (this.Ec = !0, t().catch((t => {
+                this.Tc = t, this.Ec = !1;
                 const e = 
                 /**
      * Chrome includes Error.message in Error.stack. Other browsers do not.
@@ -12073,38 +13895,38 @@ var app = (function () {
                 // all further attempts to chain (via .then) will just short-circuit
                 // and return the rejected Promise.
                 throw O("INTERNAL UNHANDLED ERROR: ", e), t;
-            })).then((t => (this.ga = !1, t))))));
-            return this.fa = e, e;
+            })).then((t => (this.Ec = !1, t))))));
+            return this._c = e, e;
         }
         enqueueAfterDelay(t, e, n) {
-            this.Ea(), 
+            this.bc(), 
             // Fast-forward delays for timerIds that have been overriden.
-            this.pa.indexOf(t) > -1 && (e = 0);
-            const s = xo.createAndSchedule(this, t, e, n, (t => this.Ra(t)));
-            return this._a.push(s), s;
+            this.Ac.indexOf(t) > -1 && (e = 0);
+            const s = xo.createAndSchedule(this, t, e, n, (t => this.Vc(t)));
+            return this.yc.push(s), s;
         }
-        Ea() {
-            this.ma && L();
+        bc() {
+            this.Tc && L();
         }
         verifyOperationInProgress() {}
         /**
          * Waits until all currently queued tasks are finished executing. Delayed
          * operations are not run.
-         */    async ba() {
+         */    async Sc() {
             // Operations in the queue prior to draining may have enqueued additional
             // operations. Keep draining the queue until the tail is no longer advanced,
             // which indicates that no more new operations were enqueued and that all
             // operations were executed.
             let t;
             do {
-                t = this.fa, await t;
-            } while (t !== this.fa);
+                t = this._c, await t;
+            } while (t !== this._c);
         }
         /**
          * For Tests: Determine if a delayed operation with a particular TimerId
          * exists.
-         */    Pa(t) {
-            for (const e of this._a) if (e.timerId === t) return !0;
+         */    Dc(t) {
+            for (const e of this.yc) if (e.timerId === t) return !0;
             return !1;
         }
         /**
@@ -12113,24 +13935,24 @@ var app = (function () {
          * @param lastTimerId - Delayed operations up to and including this TimerId
          * will be drained. Pass TimerId.All to run all delayed operations.
          * @returns a Promise that resolves once all operations have been run.
-         */    va(t) {
+         */    Cc(t) {
             // Note that draining may generate more delayed ops, so we do that first.
-            return this.ba().then((() => {
+            return this.Sc().then((() => {
                 // Run ops in the same order they'd run if they ran naturally.
-                this._a.sort(((t, e) => t.targetTimeMs - e.targetTimeMs));
-                for (const e of this._a) if (e.skipDelay(), "all" /* All */ !== t && e.timerId === t) break;
-                return this.ba();
+                this.yc.sort(((t, e) => t.targetTimeMs - e.targetTimeMs));
+                for (const e of this.yc) if (e.skipDelay(), "all" /* All */ !== t && e.timerId === t) break;
+                return this.Sc();
             }));
         }
         /**
          * For Tests: Skip all subsequent delays for a timer id.
-         */    Va(t) {
-            this.pa.push(t);
+         */    Nc(t) {
+            this.Ac.push(t);
         }
-        /** Called once a DelayedOperation is run or canceled. */    Ra(t) {
+        /** Called once a DelayedOperation is run or canceled. */    Vc(t) {
             // NOTE: indexOf / slice are O(n), but delayedOperations is expected to be small.
-            const e = this._a.indexOf(t);
-            this._a.splice(e, 1);
+            const e = this.yc.indexOf(t);
+            this.yc.splice(e, 1);
         }
     }
 
@@ -12139,35 +13961,47 @@ var app = (function () {
      *
      * Do not call this constructor directly. Instead, use {@link getFirestore}.
      */
-    class kc extends Tc {
+    class ka extends Ta {
         /** @hideconstructor */
         constructor(t, e) {
             super(t, e), 
             /**
              * Whether it's a {@link Firestore} or Firestore Lite instance.
              */
-            this.type = "firestore", this._queue = new Dc, this._persistenceKey = "name" in t ? t.name : "[DEFAULT]";
+            this.type = "firestore", this._queue = new Da, this._persistenceKey = "name" in t ? t.name : "[DEFAULT]";
         }
         _terminate() {
             return this._firestoreClient || 
             // The client must be initialized to ensure that all subsequent API
             // usage throws an exception.
-            Mc(this), this._firestoreClient.terminate();
+            Ma(this), this._firestoreClient.terminate();
         }
     }
 
     /**
-     * @internal
-     */ function Fc(t) {
-        return t._firestoreClient || Mc(t), t._firestoreClient.verifyNotTerminated(), t._firestoreClient;
+     * Returns the existing {@link Firestore} instance that is associated with the
+     * provided {@link @firebase/app#FirebaseApp}. If no instance exists, initializes a new
+     * instance with default settings.
+     *
+     * @param app - The {@link @firebase/app#FirebaseApp} instance that the returned {@link Firestore}
+     * instance is associated with.
+     * @returns The {@link Firestore} instance of the provided app.
+     */ function Oa(e = getApp()) {
+        return _getProvider(e, "firestore").getImmediate();
     }
 
-    function Mc(t) {
+    /**
+     * @internal
+     */ function Fa(t) {
+        return t._firestoreClient || Ma(t), t._firestoreClient.verifyNotTerminated(), t._firestoreClient;
+    }
+
+    function Ma(t) {
         var e;
         const n = t._freezeSettings(), s = function(t, e, n, s) {
-            return new uc(t, e, n, s.host, s.ssl, s.experimentalForceLongPolling, s.experimentalAutoDetectLongPolling, s.useFetchStreams);
+            return new ua(t, e, n, s.host, s.ssl, s.experimentalForceLongPolling, s.experimentalAutoDetectLongPolling, s.useFetchStreams);
         }(t._databaseId, (null === (e = t._app) || void 0 === e ? void 0 : e.options.appId) || "", t._persistenceKey, n);
-        t._firestoreClient = new Ka(t._credentials, t._queue, s);
+        t._firestoreClient = new Kc(t._credentials, t._queue, s);
     }
 
     /**
@@ -12210,7 +14044,7 @@ var app = (function () {
      * Create a `FieldPath` by providing field names. If more than one field
      * name is provided, the path will point to a nested field in a document.
      */
-    class Jc {
+    class Ja {
         /**
          * Creates a `FieldPath` from the provided field names. If more than one field
          * name is provided, the path will point to a nested field in a document.
@@ -12249,7 +14083,7 @@ var app = (function () {
      */
     /**
      * An immutable object representing an array of bytes.
-     */ class Xc {
+     */ class Xa {
         /** @hideconstructor */
         constructor(t) {
             this._byteString = t;
@@ -12261,7 +14095,7 @@ var app = (function () {
          * @param base64 - The Base64 string used to create the `Bytes` object.
          */    static fromBase64String(t) {
             try {
-                return new Xc(_t.fromBase64String(t));
+                return new Xa(_t.fromBase64String(t));
             } catch (t) {
                 throw new j(K.INVALID_ARGUMENT, "Failed to construct data from Base64 string: " + t);
             }
@@ -12271,7 +14105,7 @@ var app = (function () {
          *
          * @param array - The Uint8Array used to create the `Bytes` object.
          */    static fromUint8Array(t) {
-            return new Xc(_t.fromUint8Array(t));
+            return new Xa(_t.fromUint8Array(t));
         }
         /**
          * Returns the underlying bytes as a Base64-encoded string.
@@ -12323,7 +14157,7 @@ var app = (function () {
     /**
      * Sentinel values that can be used when writing document fields with `set()`
      * or `update()`.
-     */ class Zc {
+     */ class Za {
         /**
          * @param _methodName - The public API endpoint that returns this class.
          * @hideconstructor
@@ -12477,55 +14311,55 @@ var app = (function () {
             this.settings = t, this.databaseId = e, this.N = n, this.ignoreUndefinedProperties = s, 
             // Minor hack: If fieldTransforms is undefined, we assume this is an
             // external call and we need to validate the entire path.
-            void 0 === i && this.Sa(), this.fieldTransforms = i || [], this.fieldMask = r || [];
+            void 0 === i && this.xc(), this.fieldTransforms = i || [], this.fieldMask = r || [];
         }
         get path() {
             return this.settings.path;
         }
-        get Da() {
-            return this.settings.Da;
+        get kc() {
+            return this.settings.kc;
         }
-        /** Returns a new context with the specified settings overwritten. */    Ca(t) {
+        /** Returns a new context with the specified settings overwritten. */    $c(t) {
             return new ru(Object.assign(Object.assign({}, this.settings), t), this.databaseId, this.N, this.ignoreUndefinedProperties, this.fieldTransforms, this.fieldMask);
         }
-        Na(t) {
+        Oc(t) {
             var e;
-            const n = null === (e = this.path) || void 0 === e ? void 0 : e.child(t), s = this.Ca({
+            const n = null === (e = this.path) || void 0 === e ? void 0 : e.child(t), s = this.$c({
                 path: n,
-                xa: !1
+                Fc: !1
             });
-            return s.ka(t), s;
+            return s.Mc(t), s;
         }
-        $a(t) {
+        Lc(t) {
             var e;
-            const n = null === (e = this.path) || void 0 === e ? void 0 : e.child(t), s = this.Ca({
+            const n = null === (e = this.path) || void 0 === e ? void 0 : e.child(t), s = this.$c({
                 path: n,
-                xa: !1
+                Fc: !1
             });
-            return s.Sa(), s;
+            return s.xc(), s;
         }
-        Oa(t) {
+        Bc(t) {
             // TODO(b/34871131): We don't support array paths right now; so make path
             // undefined.
-            return this.Ca({
+            return this.$c({
                 path: void 0,
-                xa: !0
+                Fc: !0
             });
         }
-        Fa(t) {
-            return bu(t, this.settings.methodName, this.settings.Ma || !1, this.path, this.settings.La);
+        Uc(t) {
+            return bu(t, this.settings.methodName, this.settings.qc || !1, this.path, this.settings.Kc);
         }
         /** Returns 'true' if 'fieldPath' was traversed when creating this context. */    contains(t) {
             return void 0 !== this.fieldMask.find((e => t.isPrefixOf(e))) || void 0 !== this.fieldTransforms.find((e => t.isPrefixOf(e.field)));
         }
-        Sa() {
+        xc() {
             // TODO(b/34871131): Remove null check once we have proper paths for fields
             // within arrays.
-            if (this.path) for (let t = 0; t < this.path.length; t++) this.ka(this.path.get(t));
+            if (this.path) for (let t = 0; t < this.path.length; t++) this.Mc(this.path.get(t));
         }
-        ka(t) {
-            if (0 === t.length) throw this.Fa("Document fields must not be empty");
-            if (iu(this.Da) && eu.test(t)) throw this.Fa('Document fields cannot begin and end with "__"');
+        Mc(t) {
+            if (0 === t.length) throw this.Uc("Document fields must not be empty");
+            if (iu(this.kc) && eu.test(t)) throw this.Uc('Document fields cannot begin and end with "__"');
         }
     }
 
@@ -12536,43 +14370,43 @@ var app = (function () {
         constructor(t, e, n) {
             this.databaseId = t, this.ignoreUndefinedProperties = e, this.N = n || Yr(t);
         }
-        /** Creates a new top-level parse context. */    Ba(t, e, n, s = !1) {
+        /** Creates a new top-level parse context. */    jc(t, e, n, s = !1) {
             return new ru({
-                Da: t,
+                kc: t,
                 methodName: e,
-                La: n,
+                Kc: n,
                 path: ft.emptyPath(),
-                xa: !1,
-                Ma: s
+                Fc: !1,
+                qc: s
             }, this.databaseId, this.N, this.ignoreUndefinedProperties);
         }
     }
 
-    function au(t) {
+    function cu(t) {
         const e = t._freezeSettings(), n = Yr(t._databaseId);
         return new ou(t._databaseId, !!e.ignoreUndefinedProperties, n);
     }
 
-    /** Parse document data from a set() call. */ function cu(t, e, n, s, i, r = {}) {
-        const o = t.Ba(r.merge || r.mergeFields ? 2 /* MergeSet */ : 0 /* Set */ , e, n, i);
+    /** Parse document data from a set() call. */ function au(t, e, n, s, i, r = {}) {
+        const o = t.jc(r.merge || r.mergeFields ? 2 /* MergeSet */ : 0 /* Set */ , e, n, i);
         Eu("Data must be an object, but it was:", o, s);
-        const a = pu(s, o);
-        let c, u;
-        if (r.merge) c = new dt(o.fieldMask), u = o.fieldTransforms; else if (r.mergeFields) {
+        const c = pu(s, o);
+        let a, u;
+        if (r.merge) a = new dt(o.fieldMask), u = o.fieldTransforms; else if (r.mergeFields) {
             const t = [];
             for (const s of r.mergeFields) {
                 const i = Iu(e, s, n);
                 if (!o.contains(i)) throw new j(K.INVALID_ARGUMENT, `Field '${i}' is specified in your field mask but missing from your input data.`);
                 Pu(t, i) || t.push(i);
             }
-            c = new dt(t), u = o.fieldTransforms.filter((t => c.covers(t.field)));
-        } else c = null, u = o.fieldTransforms;
-        return new nu(new Ut(a), c, u);
+            a = new dt(t), u = o.fieldTransforms.filter((t => a.covers(t.field)));
+        } else a = null, u = o.fieldTransforms;
+        return new nu(new Ut(c), a, u);
     }
 
-    class uu extends Zc {
+    class uu extends Za {
         _toFieldTransform(t) {
-            if (2 /* MergeSet */ !== t.Da) throw 1 /* Update */ === t.Da ? t.Fa(`${this._methodName}() can only appear at the top level of your update data`) : t.Fa(`${this._methodName}() cannot be used with set() unless you pass {merge:true}`);
+            if (2 /* MergeSet */ !== t.kc) throw 1 /* Update */ === t.kc ? t.Uc(`${this._methodName}() can only appear at the top level of your update data`) : t.Uc(`${this._methodName}() cannot be used with set() unless you pass {merge:true}`);
             // No transform to add for a delete, but we need to add it to our
             // fieldMask so it gets deleted.
             return t.fieldMask.push(t.path), null;
@@ -12583,40 +14417,40 @@ var app = (function () {
     }
 
     /** Parse update data from an update() call. */ function _u(t, e, n, s) {
-        const i = t.Ba(1 /* Update */ , e, n);
+        const i = t.jc(1 /* Update */ , e, n);
         Eu("Data must be an object, but it was:", i, s);
         const r = [], o = Ut.empty();
-        at(s, ((t, s) => {
-            const a = Ru(e, t, n);
+        ct(s, ((t, s) => {
+            const c = Ru(e, t, n);
             // For Compat types, we have to "extract" the underlying types before
             // performing validation.
                     s = getModularInstance(s);
-            const c = i.$a(a);
+            const a = i.Lc(c);
             if (s instanceof uu) 
             // Add it to the field mask, but don't add anything to updateData.
-            r.push(a); else {
-                const t = yu(s, c);
-                null != t && (r.push(a), o.set(a, t));
+            r.push(c); else {
+                const t = yu(s, a);
+                null != t && (r.push(c), o.set(c, t));
             }
         }));
-        const a = new dt(r);
-        return new su(o, a, i.fieldTransforms);
+        const c = new dt(r);
+        return new su(o, c, i.fieldTransforms);
     }
 
     /** Parse update data from a list of field/value arguments. */ function mu(t, e, n, s, i, r) {
-        const o = t.Ba(1 /* Update */ , e, n), a = [ Iu(e, s, n) ], c = [ i ];
+        const o = t.jc(1 /* Update */ , e, n), c = [ Iu(e, s, n) ], a = [ i ];
         if (r.length % 2 != 0) throw new j(K.INVALID_ARGUMENT, `Function ${e}() needs to be called with an even number of arguments that alternate between field names and values.`);
-        for (let t = 0; t < r.length; t += 2) a.push(Iu(e, r[t])), c.push(r[t + 1]);
+        for (let t = 0; t < r.length; t += 2) c.push(Iu(e, r[t])), a.push(r[t + 1]);
         const u = [], h = Ut.empty();
         // We iterate in reverse order to pick the last value for a field if the
         // user specified the field multiple times.
-        for (let t = a.length - 1; t >= 0; --t) if (!Pu(u, a[t])) {
-            const e = a[t];
-            let n = c[t];
+        for (let t = c.length - 1; t >= 0; --t) if (!Pu(u, c[t])) {
+            const e = c[t];
+            let n = a[t];
             // For Compat types, we have to "extract" the underlying types before
             // performing validation.
                     n = getModularInstance(n);
-            const s = o.$a(e);
+            const s = o.Lc(e);
             if (n instanceof uu) 
             // Add it to the field mask, but don't add anything to updateData.
             u.push(e); else {
@@ -12641,7 +14475,7 @@ var app = (function () {
         // Unwrap the API type from the Compat SDK. This will return the API type
         // from firestore-exp.
         t = getModularInstance(t))) return Eu("Unsupported field value:", e, t), pu(t, e);
-        if (t instanceof Zc) 
+        if (t instanceof Za) 
         // FieldValues usually parse into transforms (except FieldValue.delete())
         // in which case we do not want to include this field in our parsed data
         // (as doing so will overwrite the field directly prior to the transform
@@ -12653,8 +14487,8 @@ var app = (function () {
      */
         return function(t, e) {
             // Sentinels are only supported with writes, and not within arrays.
-            if (!iu(e.Da)) throw e.Fa(`${t._methodName}() can only be used with update() and set()`);
-            if (!e.path) throw e.Fa(`${t._methodName}() is not currently supported inside arrays`);
+            if (!iu(e.kc)) throw e.Uc(`${t._methodName}() can only be used with update() and set()`);
+            if (!e.path) throw e.Uc(`${t._methodName}() is not currently supported inside arrays`);
             const n = t._toFieldTransform(e);
             n && e.fieldTransforms.push(n);
         }
@@ -12678,12 +14512,12 @@ var app = (function () {
             // the set of values to be included for the IN query) that may directly
             // contain additional arrays (each representing an individual field
             // value), so we disable this validation.
-            if (e.settings.xa && 4 /* ArrayArgument */ !== e.Da) throw e.Fa("Nested arrays are not supported");
+            if (e.settings.Fc && 4 /* ArrayArgument */ !== e.kc) throw e.Uc("Nested arrays are not supported");
             return function(t, e) {
                 const n = [];
                 let s = 0;
                 for (const i of t) {
-                    let t = yu(i, e.Oa(s));
+                    let t = yu(i, e.Bc(s));
                     null == t && (
                     // Just include nulls in the array for fields being replaced with a
                     // sentinel.
@@ -12730,17 +14564,17 @@ var app = (function () {
                     longitude: t.longitude
                 }
             };
-            if (t instanceof Xc) return {
+            if (t instanceof Xa) return {
                 bytesValue: qn(e.N, t._byteString)
             };
-            if (t instanceof Ic) {
+            if (t instanceof Ia) {
                 const n = e.databaseId, s = t.firestore._databaseId;
-                if (!s.isEqual(n)) throw e.Fa(`Document reference is for database ${s.projectId}/${s.database} but should be for database ${n.projectId}/${n.database}`);
+                if (!s.isEqual(n)) throw e.Uc(`Document reference is for database ${s.projectId}/${s.database} but should be for database ${n.projectId}/${n.database}`);
                 return {
                     referenceValue: Qn(t.firestore._databaseId || e.databaseId, t._key.path)
                 };
             }
-            throw e.Fa(`Unsupported field value: ${mc(t)}`);
+            throw e.Uc(`Unsupported field value: ${ma(t)}`);
         }
         /**
      * Checks whether an object looks like a JSON object that should be converted
@@ -12753,11 +14587,11 @@ var app = (function () {
 
     function pu(t, e) {
         const n = {};
-        return ct(t) ? 
+        return at(t) ? 
         // If we encounter an empty object, we explicitly add it to the update
         // mask to ensure that the server creates a map entry.
-        e.path && e.path.length > 0 && e.fieldMask.push(e.path) : at(t, ((t, s) => {
-            const i = yu(s, e.Na(t));
+        e.path && e.path.length > 0 && e.fieldMask.push(e.path) : ct(t, ((t, s) => {
+            const i = yu(s, e.Oc(t));
             null != i && (n[t] = i);
         })), {
             mapValue: {
@@ -12767,15 +14601,15 @@ var app = (function () {
     }
 
     function Tu(t) {
-        return !("object" != typeof t || null === t || t instanceof Array || t instanceof Date || t instanceof it || t instanceof tu || t instanceof Xc || t instanceof Ic || t instanceof Zc);
+        return !("object" != typeof t || null === t || t instanceof Array || t instanceof Date || t instanceof it || t instanceof tu || t instanceof Xa || t instanceof Ia || t instanceof Za);
     }
 
     function Eu(t, e, n) {
         if (!Tu(n) || !function(t) {
             return "object" == typeof t && null !== t && (Object.getPrototypeOf(t) === Object.prototype || null === Object.getPrototypeOf(t));
         }(n)) {
-            const s = mc(n);
-            throw "an object" === s ? e.Fa(t + " a custom object") : e.Fa(t + " " + s);
+            const s = ma(n);
+            throw "an object" === s ? e.Uc(t + " a custom object") : e.Uc(t + " " + s);
         }
     }
 
@@ -12785,7 +14619,7 @@ var app = (function () {
         if ((
         // If required, replace the FieldPath Compat class with with the firestore-exp
         // FieldPath.
-        e = getModularInstance(e)) instanceof Jc) return e._internalPath;
+        e = getModularInstance(e)) instanceof Ja) return e._internalPath;
         if ("string" == typeof e) return Ru(t, e);
         throw bu("Field path arguments must be of type string or FieldPath.", t, 
         /* hasConverter= */ !1, 
@@ -12809,7 +14643,7 @@ var app = (function () {
         /* hasConverter= */ !1, 
         /* path= */ void 0, n);
         try {
-            return new Jc(...e.split("."))._internalPath;
+            return new Ja(...e.split("."))._internalPath;
         } catch (s) {
             throw bu(`Invalid field path (${e}). Paths must not be empty, begin with '.', end with '.', or contain '..'`, t, 
             /* hasConverter= */ !1, 
@@ -12819,11 +14653,11 @@ var app = (function () {
 
     function bu(t, e, n, s, i) {
         const r = s && !s.isEmpty(), o = void 0 !== i;
-        let a = `Function ${e}() called with invalid data`;
-        n && (a += " (via `toFirestore()`)"), a += ". ";
-        let c = "";
-        return (r || o) && (c += " (found", r && (c += ` in field ${s}`), o && (c += ` in document ${i}`), 
-        c += ")"), new j(K.INVALID_ARGUMENT, a + t + c);
+        let c = `Function ${e}() called with invalid data`;
+        n && (c += " (via `toFirestore()`)"), c += ". ";
+        let a = "";
+        return (r || o) && (a += " (found", r && (a += ` in field ${s}`), o && (a += ` in document ${i}`), 
+        a += ")"), new j(K.INVALID_ARGUMENT, c + t + a);
     }
 
     /** Checks `haystack` if FieldPath `needle` is present. Runs in O(n). */ function Pu(t, e) {
@@ -12870,7 +14704,7 @@ var app = (function () {
         /**
          * The `DocumentReference` for the document included in the `DocumentSnapshot`.
          */    get ref() {
-            return new Ic(this._firestore, this._converter, this._key);
+            return new Ia(this._firestore, this._converter, this._key);
         }
         /**
          * Signals whether or not the document at the snapshot's location exists.
@@ -12941,7 +14775,7 @@ var app = (function () {
     /**
      * Helper that calls `fromDotSeparatedString()` but wraps any error thrown.
      */ function Su(t, e) {
-        return "string" == typeof e ? Ru(t, e) : e instanceof Jc ? e._internalPath : e._delegate._internalPath;
+        return "string" == typeof e ? Ru(t, e) : e instanceof Ja ? e._internalPath : e._delegate._internalPath;
     }
 
     /**
@@ -13251,7 +15085,7 @@ var app = (function () {
         }
         convertObject(t, e) {
             const n = {};
-            return at(t.fields, ((t, s) => {
+            return ct(t.fields, ((t, s) => {
                 n[t] = this.convertValue(s, e);
             })), n;
         }
@@ -13281,7 +15115,7 @@ var app = (function () {
         convertDocumentKey(t, e) {
             const n = ht.fromString(t);
             B(Ts(n));
-            const s = new hc(n.get(1), n.get(3)), i = new Pt(n.popFirst(5));
+            const s = new ha(n.get(1), n.get(3)), i = new Pt(n.popFirst(5));
             return s.isEqual(e) || 
             // TODO(b/64130202): Somehow support foreign references.
             O(`Document ${i} contains a document reference within a different database (${s.projectId}/${s.database}) which is not supported. It will be treated as a reference in the current database (${e.projectId}/${e.database}) instead.`), 
@@ -13322,16 +15156,16 @@ var app = (function () {
         s;
     }
 
-    class ch extends nh {
+    class ah extends nh {
         constructor(t) {
             super(), this.firestore = t;
         }
         convertBytes(t) {
-            return new Xc(t);
+            return new Xa(t);
         }
         convertReference(t) {
             const e = this.convertDocumentKey(t, this.firestore._databaseId);
-            return new Ic(this.firestore, /* converter= */ null, e);
+            return new Ia(this.firestore, /* converter= */ null, e);
         }
     }
 
@@ -13345,19 +15179,19 @@ var app = (function () {
      *
      * @returns A `Promise` that will be resolved with the results of the query.
      */ function lh(t) {
-        t = gc(t, Ac);
-        const e = gc(t.firestore, kc), n = Fc(e), s = new ch(e);
-        return Ou(t._query), ic(n, t._query).then((n => new xu(e, s, t, n)));
+        t = ga(t, Aa);
+        const e = ga(t.firestore, ka), n = Fa(e), s = new ah(e);
+        return Ou(t._query), ia(n, t._query).then((n => new xu(e, s, t, n)));
     }
 
     function _h(t, e, n, ...s) {
-        t = gc(t, Ic);
-        const i = gc(t.firestore, kc), r = au(i);
+        t = ga(t, Ia);
+        const i = ga(t.firestore, ka), r = cu(i);
         let o;
         o = "string" == typeof (
         // For Compat types, we have to "extract" the underlying types before
         // performing validation.
-        e = getModularInstance(e)) || e instanceof Jc ? mu(r, "updateDoc", t._key, e, n, s) : _u(r, "updateDoc", t._key, e);
+        e = getModularInstance(e)) || e instanceof Ja ? mu(r, "updateDoc", t._key, e, n, s) : _u(r, "updateDoc", t._key, e);
         return Th(i, [ o.toMutation(t._key, Ge.exists(!0)) ]);
     }
 
@@ -13368,7 +15202,7 @@ var app = (function () {
      * @returns A Promise resolved once the document has been successfully
      * deleted from the backend (note that it won't resolve while you're offline).
      */ function mh(t) {
-        return Th(gc(t.firestore, kc), [ new an(t._key, Ge.none()) ]);
+        return Th(ga(t.firestore, ka), [ new cn(t._key, Ge.none()) ]);
     }
 
     /**
@@ -13381,8 +15215,8 @@ var app = (function () {
      * newly created document after it has been written to the backend (Note that it
      * won't resolve while you're offline).
      */ function gh(t, e) {
-        const n = gc(t.firestore, kc), s = vc(t), i = sh(t.converter, e);
-        return Th(n, [ cu(au(t.firestore), "addDoc", s._key, i, null !== t.converter, {}).toMutation(s._key, Ge.exists(!1)) ]).then((() => s));
+        const n = ga(t.firestore, ka), s = va(t), i = sh(t.converter, e);
+        return Th(n, [ au(cu(t.firestore), "addDoc", s._key, i, null !== t.converter, {}).toMutation(s._key, Ge.exists(!1)) ]).then((() => s));
     }
 
     /**
@@ -13391,32 +15225,494 @@ var app = (function () {
      */ function Th(t, e) {
         return function(t, e) {
             const n = new Q;
-            return t.asyncQueue.enqueueAndForget((async () => ra(await Ya(t), e, n))), n.promise;
-        }(Fc(t), e);
+            return t.asyncQueue.enqueueAndForget((async () => rc(await Yc(t), e, n))), n.promise;
+        }(Fa(t), e);
     }
 
     /**
      * Cloud Firestore
      *
      * @packageDocumentation
-     */ var Dh;
+     */ !function(t, e = !0) {
+        !function(t) {
+            C = t;
+        }(SDK_VERSION), _registerComponent(new Component("firestore", ((t, {options: n}) => {
+            const s = t.getProvider("app").getImmediate(), i = new ka(s, new H(t.getProvider("auth-internal")));
+            return n = Object.assign({
+                useFetchStreams: e
+            }, n), i._setSettings(n), i;
+        }), "PUBLIC" /* PUBLIC */)), registerVersion(S, "3.2.0", t), 
+        // BUILD_TARGET will be replaced by values like esm5, esm2017, cjs5, etc during the compilation
+        registerVersion(S, "3.2.0", "esm2017");
+    }();
 
-    !function(t) {
-        C = t;
-    }(SDK_VERSION), _registerComponent(new Component("firestore", ((t, {options: e}) => {
-        const n = t.getProvider("app").getImmediate(), s = new kc(n, new H(t.getProvider("auth-internal")));
-        return e = Object.assign({
-            useFetchStreams: !0
-        }, e), s._setSettings(e), s;
-    }), "PUBLIC" /* PUBLIC */)), registerVersion(S, "3.1.1", Dh), 
-    // BUILD_TARGET will be replaced by values like esm5, esm2017, cjs5, etc during the compilation
-    registerVersion(S, "3.1.1", "esm2017");
+    // Import the functions you need from the SDKs you need
+    // TODO: Add SDKs for Firebase products that you want to use
+    // https://firebase.google.com/docs/web/setup#available-libraries
 
-    /* src/App.svelte generated by Svelte v3.44.0 */
+    // Your web app's Firebase configuration
+    const firebaseConfig = {
+      apiKey: "AIzaSyBAeLvzZzgp9tjlOt9JhA_tGKQb6EV1qr0",
+      authDomain: "svelteproject-37390.firebaseapp.com",
+      projectId: "svelteproject-37390",
+      storageBucket: "svelteproject-37390.appspot.com",
+      messagingSenderId: "1030684667807",
+      appId: "1:1030684667807:web:043c60e633f6a5619e57aa"
+    };
+
+    // Initialize Firebase
+    initializeApp(firebaseConfig);
+    const db = Oa();
+
+    /* src/pages/alumns.svelte generated by Svelte v3.44.0 */
+
+    const { console: console_1$1 } = globals;
+
+    const file$2 = "src/pages/alumns.svelte";
+
+    function get_each_context$1(ctx, list, i) {
+    	const child_ctx = ctx.slice();
+    	child_ctx[7] = list[i];
+    	return child_ctx;
+    }
+
+    // (65:4) {:else}
+    function create_else_block$1(ctx) {
+    	let p;
+    	let t0;
+    	let t1_value = /*i*/ ctx[7].idWork + "";
+    	let t1;
+
+    	const block = {
+    		c: function create() {
+    			p = element("p");
+    			t0 = text("Trabajo: ");
+    			t1 = text(t1_value);
+    			add_location(p, file$2, 65, 5, 1346);
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, p, anchor);
+    			append_dev(p, t0);
+    			append_dev(p, t1);
+    		},
+    		p: function update(ctx, dirty) {
+    			if (dirty & /*alumns*/ 2 && t1_value !== (t1_value = /*i*/ ctx[7].idWork + "")) set_data_dev(t1, t1_value);
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(p);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_else_block$1.name,
+    		type: "else",
+    		source: "(65:4) {:else}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (63:4) {#if i.idWork == ''}
+    function create_if_block$1(ctx) {
+    	let p;
+
+    	const block = {
+    		c: function create() {
+    			p = element("p");
+    			p.textContent = "Trabajo: Sin asignar";
+    			add_location(p, file$2, 63, 5, 1301);
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, p, anchor);
+    		},
+    		p: noop,
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(p);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block$1.name,
+    		type: "if",
+    		source: "(63:4) {#if i.idWork == ''}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (59:2) {#each alumns as i}
+    function create_each_block$1(ctx) {
+    	let div;
+    	let p0;
+    	let t0;
+    	let t1_value = /*i*/ ctx[7].name + "";
+    	let t1;
+    	let t2;
+    	let p1;
+    	let t3;
+    	let t4_value = /*i*/ ctx[7].course + "";
+    	let t4;
+    	let t5;
+    	let t6;
+    	let br;
+
+    	function select_block_type(ctx, dirty) {
+    		if (/*i*/ ctx[7].idWork == '') return create_if_block$1;
+    		return create_else_block$1;
+    	}
+
+    	let current_block_type = select_block_type(ctx);
+    	let if_block = current_block_type(ctx);
+
+    	const block = {
+    		c: function create() {
+    			div = element("div");
+    			p0 = element("p");
+    			t0 = text("Nombre: ");
+    			t1 = text(t1_value);
+    			t2 = space();
+    			p1 = element("p");
+    			t3 = text("Curso: ");
+    			t4 = text(t4_value);
+    			t5 = space();
+    			if_block.c();
+    			t6 = space();
+    			br = element("br");
+    			add_location(p0, file$2, 60, 4, 1218);
+    			add_location(p1, file$2, 61, 4, 1246);
+    			add_location(div, file$2, 59, 3, 1208);
+    			add_location(br, file$2, 68, 3, 1396);
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, div, anchor);
+    			append_dev(div, p0);
+    			append_dev(p0, t0);
+    			append_dev(p0, t1);
+    			append_dev(div, t2);
+    			append_dev(div, p1);
+    			append_dev(p1, t3);
+    			append_dev(p1, t4);
+    			append_dev(div, t5);
+    			if_block.m(div, null);
+    			insert_dev(target, t6, anchor);
+    			insert_dev(target, br, anchor);
+    		},
+    		p: function update(ctx, dirty) {
+    			if (dirty & /*alumns*/ 2 && t1_value !== (t1_value = /*i*/ ctx[7].name + "")) set_data_dev(t1, t1_value);
+    			if (dirty & /*alumns*/ 2 && t4_value !== (t4_value = /*i*/ ctx[7].course + "")) set_data_dev(t4, t4_value);
+
+    			if (current_block_type === (current_block_type = select_block_type(ctx)) && if_block) {
+    				if_block.p(ctx, dirty);
+    			} else {
+    				if_block.d(1);
+    				if_block = current_block_type(ctx);
+
+    				if (if_block) {
+    					if_block.c();
+    					if_block.m(div, null);
+    				}
+    			}
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(div);
+    			if_block.d();
+    			if (detaching) detach_dev(t6);
+    			if (detaching) detach_dev(br);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_each_block$1.name,
+    		type: "each",
+    		source: "(59:2) {#each alumns as i}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function create_fragment$2(ctx) {
+    	let main;
+    	let h1;
+    	let t1;
+    	let form;
+    	let label0;
+    	let t3;
+    	let input0;
+    	let t4;
+    	let label1;
+    	let t6;
+    	let input1;
+    	let t7;
+    	let button;
+    	let t9;
+    	let h2;
+    	let t11;
+    	let div;
+    	let mounted;
+    	let dispose;
+    	let each_value = /*alumns*/ ctx[1];
+    	validate_each_argument(each_value);
+    	let each_blocks = [];
+
+    	for (let i = 0; i < each_value.length; i += 1) {
+    		each_blocks[i] = create_each_block$1(get_each_context$1(ctx, each_value, i));
+    	}
+
+    	const block = {
+    		c: function create() {
+    			main = element("main");
+    			h1 = element("h1");
+    			h1.textContent = "Agregar nuevo usuario:";
+    			t1 = space();
+    			form = element("form");
+    			label0 = element("label");
+    			label0.textContent = "Nombre del alumno:";
+    			t3 = space();
+    			input0 = element("input");
+    			t4 = space();
+    			label1 = element("label");
+    			label1.textContent = "Curso al que pertenece el alumno";
+    			t6 = space();
+    			input1 = element("input");
+    			t7 = space();
+    			button = element("button");
+    			button.textContent = "Agregar";
+    			t9 = space();
+    			h2 = element("h2");
+    			h2.textContent = "Lista de alumnos:";
+    			t11 = space();
+    			div = element("div");
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].c();
+    			}
+
+    			add_location(h1, file$2, 38, 1, 677);
+    			attr_dev(label0, "for", "alumnName");
+    			add_location(label0, file$2, 40, 2, 767);
+    			attr_dev(input0, "type", "text");
+    			attr_dev(input0, "id", "alumnName");
+    			attr_dev(input0, "placeholder", "Nombre");
+    			add_location(input0, file$2, 41, 2, 819);
+    			attr_dev(label1, "for", "alumnCourse");
+    			add_location(label1, file$2, 47, 2, 918);
+    			attr_dev(input1, "type", "text");
+    			attr_dev(input1, "id", "alumnCourse");
+    			attr_dev(input1, "placeholder", "Curso");
+    			add_location(input1, file$2, 48, 2, 986);
+    			add_location(button, file$2, 54, 2, 1087);
+    			add_location(form, file$2, 39, 1, 710);
+    			add_location(h2, file$2, 56, 1, 1122);
+    			attr_dev(div, "class", "addAlumnsContainer");
+    			add_location(div, file$2, 57, 1, 1150);
+    			add_location(main, file$2, 37, 0, 669);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, main, anchor);
+    			append_dev(main, h1);
+    			append_dev(main, t1);
+    			append_dev(main, form);
+    			append_dev(form, label0);
+    			append_dev(form, t3);
+    			append_dev(form, input0);
+    			set_input_value(input0, /*alumn*/ ctx[0].name);
+    			append_dev(form, t4);
+    			append_dev(form, label1);
+    			append_dev(form, t6);
+    			append_dev(form, input1);
+    			set_input_value(input1, /*alumn*/ ctx[0].course);
+    			append_dev(form, t7);
+    			append_dev(form, button);
+    			append_dev(main, t9);
+    			append_dev(main, h2);
+    			append_dev(main, t11);
+    			append_dev(main, div);
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].m(div, null);
+    			}
+
+    			if (!mounted) {
+    				dispose = [
+    					listen_dev(input0, "input", /*input0_input_handler*/ ctx[4]),
+    					listen_dev(input1, "input", /*input1_input_handler*/ ctx[5]),
+    					listen_dev(form, "submit", prevent_default(/*onAlumnSubmitHandler*/ ctx[2]), false, true, false)
+    				];
+
+    				mounted = true;
+    			}
+    		},
+    		p: function update(ctx, [dirty]) {
+    			if (dirty & /*alumn*/ 1 && input0.value !== /*alumn*/ ctx[0].name) {
+    				set_input_value(input0, /*alumn*/ ctx[0].name);
+    			}
+
+    			if (dirty & /*alumn*/ 1 && input1.value !== /*alumn*/ ctx[0].course) {
+    				set_input_value(input1, /*alumn*/ ctx[0].course);
+    			}
+
+    			if (dirty & /*alumns*/ 2) {
+    				each_value = /*alumns*/ ctx[1];
+    				validate_each_argument(each_value);
+    				let i;
+
+    				for (i = 0; i < each_value.length; i += 1) {
+    					const child_ctx = get_each_context$1(ctx, each_value, i);
+
+    					if (each_blocks[i]) {
+    						each_blocks[i].p(child_ctx, dirty);
+    					} else {
+    						each_blocks[i] = create_each_block$1(child_ctx);
+    						each_blocks[i].c();
+    						each_blocks[i].m(div, null);
+    					}
+    				}
+
+    				for (; i < each_blocks.length; i += 1) {
+    					each_blocks[i].d(1);
+    				}
+
+    				each_blocks.length = each_value.length;
+    			}
+    		},
+    		i: noop,
+    		o: noop,
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(main);
+    			destroy_each(each_blocks, detaching);
+    			mounted = false;
+    			run_all(dispose);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$2.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance$2($$self, $$props, $$invalidate) {
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots('Alumns', slots, []);
+    	let { url = '/alumns' } = $$props;
+    	let alumn = { name: '', course: '', idWork: '' };
+    	let alumns = [];
+
+    	const loadAlumns = async () => {
+    		const querySnapshot = await lh(ba(db, 'alumns'));
+    		let dbAlumn = [];
+
+    		querySnapshot.forEach(doc => {
+    			dbAlumn.push({ ...doc.data(), id: doc.id });
+    		});
+
+    		$$invalidate(1, alumns = [...dbAlumn]);
+    		console.log(alumns);
+    	};
+
+    	loadAlumns();
+
+    	const onAlumnSubmitHandler = async e => {
+    		await gh(ba(db, 'alumns'), alumn);
+    		await loadAlumns();
+    	};
+
+    	const writable_props = ['url'];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console_1$1.warn(`<Alumns> was created with unknown prop '${key}'`);
+    	});
+
+    	function input0_input_handler() {
+    		alumn.name = this.value;
+    		$$invalidate(0, alumn);
+    	}
+
+    	function input1_input_handler() {
+    		alumn.course = this.value;
+    		$$invalidate(0, alumn);
+    	}
+
+    	$$self.$$set = $$props => {
+    		if ('url' in $$props) $$invalidate(3, url = $$props.url);
+    	};
+
+    	$$self.$capture_state = () => ({
+    		db,
+    		collection: ba,
+    		getDocs: lh,
+    		doc: va,
+    		addDoc: gh,
+    		updateDoc: _h,
+    		deleteDoc: mh,
+    		url,
+    		alumn,
+    		alumns,
+    		loadAlumns,
+    		onAlumnSubmitHandler
+    	});
+
+    	$$self.$inject_state = $$props => {
+    		if ('url' in $$props) $$invalidate(3, url = $$props.url);
+    		if ('alumn' in $$props) $$invalidate(0, alumn = $$props.alumn);
+    		if ('alumns' in $$props) $$invalidate(1, alumns = $$props.alumns);
+    	};
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	return [
+    		alumn,
+    		alumns,
+    		onAlumnSubmitHandler,
+    		url,
+    		input0_input_handler,
+    		input1_input_handler
+    	];
+    }
+
+    class Alumns extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$2, create_fragment$2, safe_not_equal, { url: 3 });
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Alumns",
+    			options,
+    			id: create_fragment$2.name
+    		});
+    	}
+
+    	get url() {
+    		throw new Error("<Alumns>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set url(value) {
+    		throw new Error("<Alumns>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+    }
+
+    /* src/pages/works.svelte generated by Svelte v3.44.0 */
 
     const { console: console_1 } = globals;
 
-    const file = "src/App.svelte";
+    const file$1 = "src/pages/works.svelte";
 
     function get_each_context(ctx, list, i) {
     	const child_ctx = ctx.slice();
@@ -13424,34 +15720,152 @@ var app = (function () {
     	return child_ctx;
     }
 
-    // (40:2) {#each alumns as i}
-    function create_each_block(ctx) {
-    	let div;
+    // (64:4) {:else}
+    function create_else_block(ctx) {
     	let p;
-    	let t0_value = /*i*/ ctx[6].name + "";
     	let t0;
+    	let t1_value = /*i*/ ctx[6].idWork + "";
     	let t1;
 
     	const block = {
     		c: function create() {
-    			div = element("div");
     			p = element("p");
-    			t0 = text(t0_value);
-    			t1 = space();
-    			add_location(p, file, 41, 4, 729);
-    			add_location(div, file, 40, 3, 719);
+    			t0 = text("Trabajo: ");
+    			t1 = text(t1_value);
+    			add_location(p, file$1, 64, 5, 1315);
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, p, anchor);
+    			append_dev(p, t0);
+    			append_dev(p, t1);
+    		},
+    		p: function update(ctx, dirty) {
+    			if (dirty & /*alumns*/ 2 && t1_value !== (t1_value = /*i*/ ctx[6].idWork + "")) set_data_dev(t1, t1_value);
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(p);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_else_block.name,
+    		type: "else",
+    		source: "(64:4) {:else}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (62:4) {#if i.idWork == ''}
+    function create_if_block(ctx) {
+    	let p;
+
+    	const block = {
+    		c: function create() {
+    			p = element("p");
+    			p.textContent = "Trabajo: Sin asignar";
+    			add_location(p, file$1, 62, 5, 1270);
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, p, anchor);
+    		},
+    		p: noop,
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(p);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block.name,
+    		type: "if",
+    		source: "(62:4) {#if i.idWork == ''}",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (58:2) {#each alumns as i}
+    function create_each_block(ctx) {
+    	let div;
+    	let p0;
+    	let t0;
+    	let t1_value = /*i*/ ctx[6].name + "";
+    	let t1;
+    	let t2;
+    	let p1;
+    	let t3;
+    	let t4_value = /*i*/ ctx[6].course + "";
+    	let t4;
+    	let t5;
+    	let t6;
+    	let br;
+
+    	function select_block_type(ctx, dirty) {
+    		if (/*i*/ ctx[6].idWork == '') return create_if_block;
+    		return create_else_block;
+    	}
+
+    	let current_block_type = select_block_type(ctx);
+    	let if_block = current_block_type(ctx);
+
+    	const block = {
+    		c: function create() {
+    			div = element("div");
+    			p0 = element("p");
+    			t0 = text("Nombre: ");
+    			t1 = text(t1_value);
+    			t2 = space();
+    			p1 = element("p");
+    			t3 = text("Curso: ");
+    			t4 = text(t4_value);
+    			t5 = space();
+    			if_block.c();
+    			t6 = space();
+    			br = element("br");
+    			add_location(p0, file$1, 59, 4, 1187);
+    			add_location(p1, file$1, 60, 4, 1215);
+    			add_location(div, file$1, 58, 3, 1177);
+    			add_location(br, file$1, 67, 3, 1365);
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, div, anchor);
-    			append_dev(div, p);
-    			append_dev(p, t0);
-    			append_dev(div, t1);
+    			append_dev(div, p0);
+    			append_dev(p0, t0);
+    			append_dev(p0, t1);
+    			append_dev(div, t2);
+    			append_dev(div, p1);
+    			append_dev(p1, t3);
+    			append_dev(p1, t4);
+    			append_dev(div, t5);
+    			if_block.m(div, null);
+    			insert_dev(target, t6, anchor);
+    			insert_dev(target, br, anchor);
     		},
     		p: function update(ctx, dirty) {
-    			if (dirty & /*alumns*/ 2 && t0_value !== (t0_value = /*i*/ ctx[6].name + "")) set_data_dev(t0, t0_value);
+    			if (dirty & /*alumns*/ 2 && t1_value !== (t1_value = /*i*/ ctx[6].name + "")) set_data_dev(t1, t1_value);
+    			if (dirty & /*alumns*/ 2 && t4_value !== (t4_value = /*i*/ ctx[6].course + "")) set_data_dev(t4, t4_value);
+
+    			if (current_block_type === (current_block_type = select_block_type(ctx)) && if_block) {
+    				if_block.p(ctx, dirty);
+    			} else {
+    				if_block.d(1);
+    				if_block = current_block_type(ctx);
+
+    				if (if_block) {
+    					if_block.c();
+    					if_block.m(div, null);
+    				}
+    			}
     		},
     		d: function destroy(detaching) {
     			if (detaching) detach_dev(div);
+    			if_block.d();
+    			if (detaching) detach_dev(t6);
+    			if (detaching) detach_dev(br);
     		}
     	};
 
@@ -13459,29 +15873,31 @@ var app = (function () {
     		block,
     		id: create_each_block.name,
     		type: "each",
-    		source: "(40:2) {#each alumns as i}",
+    		source: "(58:2) {#each alumns as i}",
     		ctx
     	});
 
     	return block;
     }
 
-    function create_fragment(ctx) {
+    function create_fragment$1(ctx) {
     	let main;
-    	let div;
-    	let t0;
-    	let h2;
-    	let t2;
+    	let h1;
+    	let t1;
     	let form;
     	let label0;
-    	let t4;
+    	let t3;
     	let input0;
-    	let t5;
+    	let t4;
     	let label1;
-    	let t7;
+    	let t6;
     	let input1;
-    	let t8;
+    	let t7;
     	let button;
+    	let t9;
+    	let h2;
+    	let t11;
+    	let div;
     	let mounted;
     	let dispose;
     	let each_value = /*alumns*/ ctx[1];
@@ -13495,74 +15911,79 @@ var app = (function () {
     	const block = {
     		c: function create() {
     			main = element("main");
+    			h1 = element("h1");
+    			h1.textContent = "Agregar nuevo trabajo:";
+    			t1 = space();
+    			form = element("form");
+    			label0 = element("label");
+    			label0.textContent = "Nombre del alumno:";
+    			t3 = space();
+    			input0 = element("input");
+    			t4 = space();
+    			label1 = element("label");
+    			label1.textContent = "Curso al que pertenece el alumno";
+    			t6 = space();
+    			input1 = element("input");
+    			t7 = space();
+    			button = element("button");
+    			button.textContent = "Agregar";
+    			t9 = space();
+    			h2 = element("h2");
+    			h2.textContent = "Lista de trabajos:";
+    			t11 = space();
     			div = element("div");
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
     				each_blocks[i].c();
     			}
 
-    			t0 = space();
-    			h2 = element("h2");
-    			h2.textContent = "Agregar nuevo usuario:";
-    			t2 = space();
-    			form = element("form");
-    			label0 = element("label");
-    			label0.textContent = "Nombre del alumno:";
-    			t4 = space();
-    			input0 = element("input");
-    			t5 = space();
-    			label1 = element("label");
-    			label1.textContent = "Curso al que pertenece el alumno";
-    			t7 = space();
-    			input1 = element("input");
-    			t8 = space();
-    			button = element("button");
-    			button.textContent = "Agregar";
-    			attr_dev(div, "class", "addAlumnsContainer");
-    			add_location(div, file, 38, 1, 661);
-    			add_location(h2, file, 45, 2, 775);
+    			add_location(h1, file$1, 37, 1, 645);
     			attr_dev(label0, "for", "alumnName");
-    			add_location(label0, file, 47, 3, 867);
+    			add_location(label0, file$1, 39, 2, 735);
     			attr_dev(input0, "type", "text");
     			attr_dev(input0, "id", "alumnName");
     			attr_dev(input0, "placeholder", "Nombre");
-    			add_location(input0, file, 48, 3, 920);
+    			add_location(input0, file$1, 40, 2, 787);
     			attr_dev(label1, "for", "alumnCourse");
-    			add_location(label1, file, 54, 3, 1025);
+    			add_location(label1, file$1, 46, 2, 886);
     			attr_dev(input1, "type", "text");
     			attr_dev(input1, "id", "alumnCourse");
     			attr_dev(input1, "placeholder", "Curso");
-    			add_location(input1, file, 55, 3, 1094);
-    			add_location(button, file, 61, 3, 1201);
-    			add_location(form, file, 46, 2, 809);
-    			add_location(main, file, 37, 0, 653);
+    			add_location(input1, file$1, 47, 2, 954);
+    			add_location(button, file$1, 53, 2, 1055);
+    			add_location(form, file$1, 38, 1, 678);
+    			add_location(h2, file$1, 55, 1, 1090);
+    			attr_dev(div, "class", "addAlumnsContainer");
+    			add_location(div, file$1, 56, 1, 1119);
+    			add_location(main, file$1, 36, 0, 637);
     		},
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
     		m: function mount(target, anchor) {
     			insert_dev(target, main, anchor);
+    			append_dev(main, h1);
+    			append_dev(main, t1);
+    			append_dev(main, form);
+    			append_dev(form, label0);
+    			append_dev(form, t3);
+    			append_dev(form, input0);
+    			set_input_value(input0, /*alumn*/ ctx[0].name);
+    			append_dev(form, t4);
+    			append_dev(form, label1);
+    			append_dev(form, t6);
+    			append_dev(form, input1);
+    			set_input_value(input1, /*alumn*/ ctx[0].course);
+    			append_dev(form, t7);
+    			append_dev(form, button);
+    			append_dev(main, t9);
+    			append_dev(main, h2);
+    			append_dev(main, t11);
     			append_dev(main, div);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
     				each_blocks[i].m(div, null);
     			}
-
-    			append_dev(main, t0);
-    			append_dev(main, h2);
-    			append_dev(main, t2);
-    			append_dev(main, form);
-    			append_dev(form, label0);
-    			append_dev(form, t4);
-    			append_dev(form, input0);
-    			set_input_value(input0, /*alumn*/ ctx[0].name);
-    			append_dev(form, t5);
-    			append_dev(form, label1);
-    			append_dev(form, t7);
-    			append_dev(form, input1);
-    			set_input_value(input1, /*alumn*/ ctx[0].course);
-    			append_dev(form, t8);
-    			append_dev(form, button);
 
     			if (!mounted) {
     				dispose = [
@@ -13575,6 +15996,14 @@ var app = (function () {
     			}
     		},
     		p: function update(ctx, [dirty]) {
+    			if (dirty & /*alumn*/ 1 && input0.value !== /*alumn*/ ctx[0].name) {
+    				set_input_value(input0, /*alumn*/ ctx[0].name);
+    			}
+
+    			if (dirty & /*alumn*/ 1 && input1.value !== /*alumn*/ ctx[0].course) {
+    				set_input_value(input1, /*alumn*/ ctx[0].course);
+    			}
+
     			if (dirty & /*alumns*/ 2) {
     				each_value = /*alumns*/ ctx[1];
     				validate_each_argument(each_value);
@@ -13598,14 +16027,6 @@ var app = (function () {
 
     				each_blocks.length = each_value.length;
     			}
-
-    			if (dirty & /*alumn*/ 1 && input0.value !== /*alumn*/ ctx[0].name) {
-    				set_input_value(input0, /*alumn*/ ctx[0].name);
-    			}
-
-    			if (dirty & /*alumn*/ 1 && input1.value !== /*alumn*/ ctx[0].course) {
-    				set_input_value(input1, /*alumn*/ ctx[0].course);
-    			}
     		},
     		i: noop,
     		o: noop,
@@ -13619,7 +16040,7 @@ var app = (function () {
 
     	dispatch_dev("SvelteRegisterBlock", {
     		block,
-    		id: create_fragment.name,
+    		id: create_fragment$1.name,
     		type: "component",
     		source: "",
     		ctx
@@ -13628,41 +16049,35 @@ var app = (function () {
     	return block;
     }
 
-    function instance($$self, $$props, $$invalidate) {
+    function instance$1($$self, $$props, $$invalidate) {
     	let { $$slots: slots = {}, $$scope } = $$props;
-    	validate_slots('App', slots, []);
-
-    	let alumn = {
-    		name: '',
-    		course: '',
-    		subject: '',
-    		idWork: ''
-    	};
-
+    	validate_slots('Works', slots, []);
+    	let alumn = { name: '', course: '', idWork: '' };
     	let alumns = [];
 
     	const loadAlumns = async () => {
-    		const querySnapshot = await lh(bc(db$1, 'alumns'));
+    		const querySnapshot = await lh(ba(db, 'alumns'));
     		let dbAlumn = [];
 
     		querySnapshot.forEach(doc => {
-    			doc.push({ ...doc.data(), id: doc.idAlumn });
+    			dbAlumn.push({ ...doc.data(), id: doc.id });
     		});
 
     		$$invalidate(1, alumns = [...dbAlumn]);
     		console.log(alumns);
     	};
 
-    	//loadAlumns();
+    	loadAlumns();
+
     	const onAlumnSubmitHandler = async e => {
-    		await gh(bc(db$1, 'alumns'), alumn);
+    		await gh(ba(db, 'alumns'), alumn);
     		await loadAlumns();
     	};
 
     	const writable_props = [];
 
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console_1.warn(`<App> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console_1.warn(`<Works> was created with unknown prop '${key}'`);
     	});
 
     	function input0_input_handler() {
@@ -13676,10 +16091,10 @@ var app = (function () {
     	}
 
     	$$self.$capture_state = () => ({
-    		db: db$1,
-    		collection: bc,
+    		db,
+    		collection: ba,
     		getDocs: lh,
-    		doc: vc,
+    		doc: va,
     		addDoc: gh,
     		updateDoc: _h,
     		deleteDoc: mh,
@@ -13707,10 +16122,401 @@ var app = (function () {
     	];
     }
 
+    class Works extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$1, create_fragment$1, safe_not_equal, {});
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Works",
+    			options,
+    			id: create_fragment$1.name
+    		});
+    	}
+    }
+
+    /* src/App.svelte generated by Svelte v3.44.0 */
+    const file = "src/App.svelte";
+
+    // (11:3) <Link to='/alumns'>
+    function create_default_slot_4(ctx) {
+    	let t;
+
+    	const block = {
+    		c: function create() {
+    			t = text("Alumnos");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, t, anchor);
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(t);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_default_slot_4.name,
+    		type: "slot",
+    		source: "(11:3) <Link to='/alumns'>",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (12:3) <Link to='/works'>
+    function create_default_slot_3(ctx) {
+    	let t;
+
+    	const block = {
+    		c: function create() {
+    			t = text("Trabajos");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, t, anchor);
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(t);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_default_slot_3.name,
+    		type: "slot",
+    		source: "(12:3) <Link to='/works'>",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (15:3) <Route path='/works'>
+    function create_default_slot_2(ctx) {
+    	let works;
+    	let current;
+    	works = new Works({ $$inline: true });
+
+    	const block = {
+    		c: function create() {
+    			create_component(works.$$.fragment);
+    		},
+    		m: function mount(target, anchor) {
+    			mount_component(works, target, anchor);
+    			current = true;
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(works.$$.fragment, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(works.$$.fragment, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			destroy_component(works, detaching);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_default_slot_2.name,
+    		type: "slot",
+    		source: "(15:3) <Route path='/works'>",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (16:3) <Route path='/alumns'>
+    function create_default_slot_1(ctx) {
+    	let alumns;
+    	let current;
+    	alumns = new Alumns({ $$inline: true });
+
+    	const block = {
+    		c: function create() {
+    			create_component(alumns.$$.fragment);
+    		},
+    		m: function mount(target, anchor) {
+    			mount_component(alumns, target, anchor);
+    			current = true;
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(alumns.$$.fragment, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(alumns.$$.fragment, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			destroy_component(alumns, detaching);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_default_slot_1.name,
+    		type: "slot",
+    		source: "(16:3) <Route path='/alumns'>",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    // (8:1) <Router url='url'>
+    function create_default_slot(ctx) {
+    	let h1;
+    	let t1;
+    	let nav;
+    	let link0;
+    	let t2;
+    	let link1;
+    	let t3;
+    	let div;
+    	let route0;
+    	let t4;
+    	let route1;
+    	let current;
+
+    	link0 = new Link({
+    			props: {
+    				to: "/alumns",
+    				$$slots: { default: [create_default_slot_4] },
+    				$$scope: { ctx }
+    			},
+    			$$inline: true
+    		});
+
+    	link1 = new Link({
+    			props: {
+    				to: "/works",
+    				$$slots: { default: [create_default_slot_3] },
+    				$$scope: { ctx }
+    			},
+    			$$inline: true
+    		});
+
+    	route0 = new Route({
+    			props: {
+    				path: "/works",
+    				$$slots: { default: [create_default_slot_2] },
+    				$$scope: { ctx }
+    			},
+    			$$inline: true
+    		});
+
+    	route1 = new Route({
+    			props: {
+    				path: "/alumns",
+    				$$slots: { default: [create_default_slot_1] },
+    				$$scope: { ctx }
+    			},
+    			$$inline: true
+    		});
+
+    	const block = {
+    		c: function create() {
+    			h1 = element("h1");
+    			h1.textContent = "Pagina de inicio";
+    			t1 = space();
+    			nav = element("nav");
+    			create_component(link0.$$.fragment);
+    			t2 = space();
+    			create_component(link1.$$.fragment);
+    			t3 = space();
+    			div = element("div");
+    			create_component(route0.$$.fragment);
+    			t4 = space();
+    			create_component(route1.$$.fragment);
+    			add_location(h1, file, 8, 2, 213);
+    			add_location(nav, file, 9, 2, 241);
+    			add_location(div, file, 13, 2, 332);
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, h1, anchor);
+    			insert_dev(target, t1, anchor);
+    			insert_dev(target, nav, anchor);
+    			mount_component(link0, nav, null);
+    			append_dev(nav, t2);
+    			mount_component(link1, nav, null);
+    			insert_dev(target, t3, anchor);
+    			insert_dev(target, div, anchor);
+    			mount_component(route0, div, null);
+    			append_dev(div, t4);
+    			mount_component(route1, div, null);
+    			current = true;
+    		},
+    		p: function update(ctx, dirty) {
+    			const link0_changes = {};
+
+    			if (dirty & /*$$scope*/ 2) {
+    				link0_changes.$$scope = { dirty, ctx };
+    			}
+
+    			link0.$set(link0_changes);
+    			const link1_changes = {};
+
+    			if (dirty & /*$$scope*/ 2) {
+    				link1_changes.$$scope = { dirty, ctx };
+    			}
+
+    			link1.$set(link1_changes);
+    			const route0_changes = {};
+
+    			if (dirty & /*$$scope*/ 2) {
+    				route0_changes.$$scope = { dirty, ctx };
+    			}
+
+    			route0.$set(route0_changes);
+    			const route1_changes = {};
+
+    			if (dirty & /*$$scope*/ 2) {
+    				route1_changes.$$scope = { dirty, ctx };
+    			}
+
+    			route1.$set(route1_changes);
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(link0.$$.fragment, local);
+    			transition_in(link1.$$.fragment, local);
+    			transition_in(route0.$$.fragment, local);
+    			transition_in(route1.$$.fragment, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(link0.$$.fragment, local);
+    			transition_out(link1.$$.fragment, local);
+    			transition_out(route0.$$.fragment, local);
+    			transition_out(route1.$$.fragment, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(h1);
+    			if (detaching) detach_dev(t1);
+    			if (detaching) detach_dev(nav);
+    			destroy_component(link0);
+    			destroy_component(link1);
+    			if (detaching) detach_dev(t3);
+    			if (detaching) detach_dev(div);
+    			destroy_component(route0);
+    			destroy_component(route1);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_default_slot.name,
+    		type: "slot",
+    		source: "(8:1) <Router url='url'>",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function create_fragment(ctx) {
+    	let main;
+    	let router;
+    	let current;
+
+    	router = new Router({
+    			props: {
+    				url: "url",
+    				$$slots: { default: [create_default_slot] },
+    				$$scope: { ctx }
+    			},
+    			$$inline: true
+    		});
+
+    	const block = {
+    		c: function create() {
+    			main = element("main");
+    			create_component(router.$$.fragment);
+    			add_location(main, file, 6, 0, 184);
+    		},
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+    		m: function mount(target, anchor) {
+    			insert_dev(target, main, anchor);
+    			mount_component(router, main, null);
+    			current = true;
+    		},
+    		p: function update(ctx, [dirty]) {
+    			const router_changes = {};
+
+    			if (dirty & /*$$scope*/ 2) {
+    				router_changes.$$scope = { dirty, ctx };
+    			}
+
+    			router.$set(router_changes);
+    		},
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(router.$$.fragment, local);
+    			current = true;
+    		},
+    		o: function outro(local) {
+    			transition_out(router.$$.fragment, local);
+    			current = false;
+    		},
+    		d: function destroy(detaching) {
+    			if (detaching) detach_dev(main);
+    			destroy_component(router);
+    		}
+    	};
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
+    	return block;
+    }
+
+    function instance($$self, $$props, $$invalidate) {
+    	let { $$slots: slots = {}, $$scope } = $$props;
+    	validate_slots('App', slots, []);
+    	let { url = '' } = $$props;
+    	const writable_props = ['url'];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== '$$' && key !== 'slot') console.warn(`<App> was created with unknown prop '${key}'`);
+    	});
+
+    	$$self.$$set = $$props => {
+    		if ('url' in $$props) $$invalidate(0, url = $$props.url);
+    	};
+
+    	$$self.$capture_state = () => ({ Router, Route, Link, Alumns, Works, url });
+
+    	$$self.$inject_state = $$props => {
+    		if ('url' in $$props) $$invalidate(0, url = $$props.url);
+    	};
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	return [url];
+    }
+
     class App extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance, create_fragment, safe_not_equal, {});
+    		init(this, options, instance, create_fragment, safe_not_equal, { url: 0 });
 
     		dispatch_dev("SvelteRegisterComponent", {
     			component: this,
@@ -13719,10 +16525,19 @@ var app = (function () {
     			id: create_fragment.name
     		});
     	}
+
+    	get url() {
+    		throw new Error("<App>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set url(value) {
+    		throw new Error("<App>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
     }
 
     const app = new App({
     	target: document.body,
+    	hydratable: true,
     	props: {
     	}
     });
