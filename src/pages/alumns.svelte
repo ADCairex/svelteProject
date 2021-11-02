@@ -8,7 +8,6 @@
 		updateDoc,
 		deleteDoc,
 	} from "firebase/firestore";
-    export let url = '/alumns';
 
 	let alumn = {
 		name: '',

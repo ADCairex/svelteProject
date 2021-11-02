@@ -9,60 +9,59 @@
 		deleteDoc,
 	} from "firebase/firestore";
 
-	let alumn = {
+	let work = {
 		name: '',
-		course: '',
-		idWork: '',
+		subject: '',
+		idAlumn: '',
 	}
 
-	let alumns = [];
+	let works = [];
 	
-	const loadAlumns = async () => {
-		const querySnapshot = await getDocs(collection(db, 'alumns'));
-		let dbAlumn = [];
+	const loadWorks = async () => {
+		const querySnapshot = await getDocs(collection(db, 'works'));
+		let dbWork = [];
 		querySnapshot.forEach((doc) => {
-			dbAlumn.push({ ...doc.data(), id: doc.id });
+			dbWork.push({ ...doc.data(), id: doc.id });
 		});
-		alumns = [...dbAlumn];
-		console.log(alumns);
+		works = [...dbWork];
 	}
-	loadAlumns();
+	loadWorks();
 
 	const onAlumnSubmitHandler = async (e) => {
-		await addDoc(collection(db, 'alumns'), alumn);
-		await loadAlumns();
+		await addDoc(collection(db, 'works'), work);
+		await loadWorks();
 	}
 </script>
 
 <main>
 	<h1>Agregar nuevo trabajo:</h1>
 	<form on:submit|preventDefault={onAlumnSubmitHandler}>
-		<label for="alumnName">Nombre del alumno:</label>
+		<label for="workName">Nombre del trabajo:</label>
 		<input 
-			bind:value={alumn.name}
+			bind:value={work.name}
 			type="text"
-			id="alumnName"
+			id="workName"
 			placeholder="Nombre"
 		/>
-		<label for="alumnCourse">Curso al que pertenece el alumno</label>
+		<label for="workSubject">Asigunatura del trabajo:</label>
 		<input
 			type="text"
-			bind:value={alumn.course}
-			id="alumnCourse"
-			placeholder="Curso"
+			bind:value={work.subject}
+			id="workSubject"
+			placeholder="Asignatura"
 		/>
 		<button>Agregar</button>
 	</form>
 	<h2>Lista de trabajos:</h2>
 	<div class="addAlumnsContainer">
-		{#each alumns as i}
+		{#each works as i}
 			<div>
 				<p>Nombre: {i.name}</p>
-				<p>Curso: {i.course}</p>
-				{#if i.idWork == ''}
-					<p>Trabajo: Sin asignar</p>
+				<p>Curso: {i.subject}</p>
+				{#if i.idAlumn == ''}
+					<p>Trabajo: Sin alumno asignado</p>
 				{:else}
-					<p>Trabajo: {i.idWork}</p>
+					<p>Trabajo: Asignado</p>
 				{/if}
 			</div>
 			<br>
