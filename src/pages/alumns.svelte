@@ -8,12 +8,23 @@
 		updateDoc,
 		deleteDoc,
 	} from "firebase/firestore";
+	import { SvelteToast } from '@zerodevx/svelte-toast';
+	import { toast } from '@zerodevx/svelte-toast';
+
+	//Def the succes toast
+	const success = m => toast.push(m, {
+		theme: {
+			'--toastBackground': 'green',
+			'--toastColor': 'white',
+			'--toastBarBackground': 'olive'
+		}
+	});
 
 	let alumn = {
 		name: '',
 		course: '',
 		idWork: '',
-	}
+	};
 
 	let alumns = [];
 	
@@ -31,10 +42,13 @@
 	const onAlumnSubmitHandler = async (e) => {
 		await addDoc(collection(db, 'alumns'), alumn);
 		await loadAlumns();
+
+		success('Alumno agregado!');
 	}
 </script>
 
 <main>
+	<SvelteToast/>
 	<h1>Agregar nuevo usuario:</h1>
 	<form on:submit|preventDefault={onAlumnSubmitHandler}>
 		<label for="alumnName">Nombre del alumno:</label>

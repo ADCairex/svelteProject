@@ -8,6 +8,17 @@
 		updateDoc,
 		deleteDoc,
 	} from "firebase/firestore";
+	import { SvelteToast } from '@zerodevx/svelte-toast';
+	import { toast } from '@zerodevx/svelte-toast';
+
+	//Def the succes toast
+	const success = m => toast.push(m, {
+		theme: {
+			'--toastBackground': 'green',
+			'--toastColor': 'white',
+			'--toastBarBackground': 'olive'
+		}
+	});
 
 	let work = {
 		name: '',
@@ -30,10 +41,13 @@
 	const onAlumnSubmitHandler = async (e) => {
 		await addDoc(collection(db, 'works'), work);
 		await loadWorks();
+
+		success('Trabajo agregado!');
 	}
 </script>
 
 <main>
+	<SvelteToast/>
 	<h1>Agregar nuevo trabajo:</h1>
 	<form on:submit|preventDefault={onAlumnSubmitHandler}>
 		<label for="workName">Nombre del trabajo:</label>

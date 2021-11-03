@@ -6,12 +6,17 @@
 		doc,
         updateDoc,
 	} from "firebase/firestore";
+	import { SvelteToast } from '@zerodevx/svelte-toast';
+	import { toast } from '@zerodevx/svelte-toast';
 
-	let work = {
-		name: '',
-		subject: '',
-		idAlumn: '',
-	}
+	//Def the succes toast
+	const success = m => toast.push(m, {
+		theme: {
+			'--toastBackground': 'green',
+			'--toastColor': 'white',
+			'--toastBarBackground': 'olive'
+		}
+	});
 
     let workSelected, alumnSelected = '';
 
@@ -42,6 +47,7 @@
         await updateDoc(doc(db, 'works', work), {idAlumn: alumn});
         loadAlumns();
         loadWorks();
+        success('Trabajo asignado!')
     }
 
 	loadAlumns();
@@ -49,6 +55,7 @@
 </script>
 
 <main>
+    <SvelteToast/>
 	<h1>Asignar trabajos:</h1>
 	<div class="addAlumnsContainer">
         <form on:submit|preventDefault={assignWork(workSelected, alumnSelected)}>
@@ -75,13 +82,15 @@
     <div class="assignedWorks">
         {#each works as i}
             {#if i.idAlumn != ''}
-                <p>Trabajo: {i.name} asignado a 
+                <p>Trabajo: "{i.name}" asignado a 
                 {#each alumns as j}
                     {#if j.id == i.idAlumn}
                         {j.name}
                     {/if}
                 {/each}
                 </p>
+            {:else}
+                <p>Trabajo: "{i.name}" sin asignar</p>
             {/if}
         {/each}
     </div>
