@@ -75,7 +75,12 @@
 				{#if i.idAlumn == ''}
 					<p>Trabajo: Sin alumno asignado</p>
 				{:else}
-					<p>Trabajo: Asignado</p>
+					<p>Trabajo: Asignado a
+						{#each alumns as j}
+							{#if j.id == i.idAlumn}
+								{j.name}
+							{/if}
+						{/each}</p>
 				{/if}
 			</div>
 			<br>
