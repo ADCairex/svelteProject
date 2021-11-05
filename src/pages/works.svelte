@@ -27,6 +27,7 @@
 	}
 
 	let works = [];
+	let alumns = [];
 	
 	const loadWorks = async () => {
 		const querySnapshot = await getDocs(collection(db, 'works'));
@@ -36,6 +37,17 @@
 		});
 		works = [...dbWork];
 	}
+
+	const loadAlumns = async () => {
+		const querySnapshot = await getDocs(collection(db, 'alumns'));
+		let dbAlumn = [];
+		querySnapshot.forEach((doc) => {
+			dbAlumn.push({ ...doc.data(), id: doc.id });
+		});
+		alumns = [...dbAlumn];
+	}
+
+	loadAlumns();
 	loadWorks();
 
 	const onAlumnSubmitHandler = async (e) => {

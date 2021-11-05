@@ -58,16 +58,28 @@
 	<h1>Evaluar trabajos:</h1>
 	<div class="addAlumnsContainer">
         <form on:submit|preventDefault={evalWork(workSelected, workPoints)}>
-            <label for="workSlect">Seleccionar trabajo:</label>
+            <label for="workSlect">Seleccionar trabajo pora evaluar:</label>
             <select name="" id="workSelect" bind:value={workSelected}>
                 {#each works as i}
-                    {#if i.idAlumn != ''}
+                    {#if i.idAlumn != '' && !i.workPoints}
                         <option value="{i.id}">{i.name}</option>                    
                     {/if}
                 {/each}
             </select>
             <label for="alumnSelect">Nota del trabajo:</label>
-            <input type="text" bind:value={workPoints}>
+            <select name="workPoints" id="workPoints" bind:value={workPoints}>
+                <option value="0">0</option>
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+                <option value="5">5</option>
+                <option value="6">6</option>
+                <option value="7">7</option>
+                <option value="8">8</option>
+                <option value="9">9</option>
+                <option value="10">10</option>
+            </select>
             <br>
             <button>Puntuar</button>
         </form>
@@ -75,14 +87,23 @@
     <div class="assignedWorks">
         {#each works as i}
             {#if i.idAlumn != ''}
+                
                 <p>Trabajo: "{i.name}" asignado a 
                 {#each alumns as j}
                     {#if j.id == i.idAlumn}
                         {j.name}
                     {/if}
-                {/each}
+                {/each}                
+                {#if i.workPoints}
+                    con una nota de: {i.workPoints}.
+                {:else}
+                    sin una nota asignada.
+                {/if}
                 </p>
             {:else}
+                {#if i.workPoints}
+                    <p>x</p>
+                {/if}
                 <p>Trabajo: "{i.name}" sin asignar</p>
             {/if}
         {/each}

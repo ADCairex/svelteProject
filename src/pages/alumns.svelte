@@ -35,7 +35,6 @@
 			dbAlumn.push({ ...doc.data(), id: doc.id });
 		});
 		alumns = [...dbAlumn];
-		console.log(alumns);
 	}
 	loadAlumns();
 
